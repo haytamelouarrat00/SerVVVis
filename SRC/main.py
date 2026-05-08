@@ -2,15 +2,66 @@ import random
 from pathlib import Path
 import numpy as np
 from PIL import Image
-import cv2
 
 from dataset import load_scannet, load_colmap
 from scenes.mesh import MeshScene
 from scenes.gs import GSScene
+from features import FeatureMatcher, filter_matches
+from viz import save_match_visualization
 
 # Resolve paths relative to this file so the smoke test runs from any cwd.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-SEED = 0
+SEED = 42
+FEATURE_METHOD = 'xfeat'
+
+
+def load_real_rgb(rgb_path, camera):
+    real_rgb = Image.open(rgb_path).convert("RGB")
+    real_rgb = real_rgb.resize((camera.W, camera.H))
+    return np.array(real_rgb, dtype=np.float32) / 255.0
+
+
+def split_removed_matches(kpts1, kpts2, kpts1_kept, kpts2_kept):
+    kept_mask = np.zeros(len(kpts1), dtype=bool)
+    kept_idx = 0
+
+    for i in range(len(kpts1)):
+        if kept_idx >= len(kpts1_kept):
+            break
+        if (
+            np.allclose(kpts1[i], kpts1_kept[kept_idx])
+            and np.allclose(kpts2[i], kpts2_kept[kept_idx])
+        ):
+            kept_mask[i] = True
+            kept_idx += 1
+
+    if kept_idx != len(kpts1_kept):
+        raise RuntimeError("Filtered keypoints are not an ordered subset of matches")
+
+    return kpts1[~kept_mask], kpts2[~kept_mask]
+
+
+def save_render_matches(rendered, real, camera, matcher, output_path):
+    kpts1, kpts2 = matcher.match(rendered, real)
+    kpts1_f, kpts2_f, H_matrix, _, _ = filter_matches(kpts1, kpts2, camera)
+    kpts1_removed, kpts2_removed = split_removed_matches(kpts1, kpts2, kpts1_f, kpts2_f)
+
+    matches_removed = [(i, i) for i in range(len(kpts1_removed))]
+    matches_kept = [(i, i) for i in range(len(kpts1_f))]
+
+    save_match_visualization(
+        rendered,
+        real,
+        kpts1_removed,
+        kpts2_removed,
+        matches_removed,
+        kpts1_f,
+        kpts2_f,
+        matches_kept,
+        output_path,
+    )
+
+    return len(kpts1), len(kpts1_f), H_matrix
 
 
 def main():
@@ -18,6 +69,8 @@ def main():
     np.random.seed(SEED)
 
     scene_dir = PROJECT_ROOT / "DATA" / "kitchen"
+    matcher = FeatureMatcher(method=FEATURE_METHOD)
+    print(f"Using {FEATURE_METHOD} feature matcher")
 
     # Mesh test
     # NOTE: mesh.ply is in the ScanNet/TSDF coordinate frame, while gs.ply is
@@ -31,17 +84,15 @@ def main():
 
     mesh_scene = MeshScene(scene_dir / "mesh.ply")
     rendered_mesh = mesh_scene.render(camera)
+    real_mesh = load_real_rgb(rgb_path, camera)
 
-    real_rgb = Image.open(rgb_path).convert("RGB")
-    real_rgb = real_rgb.resize((camera.W, camera.H))
-    real_rgb_np = np.array(real_rgb, dtype=np.float32) / 255.0
-
-    output_mesh = np.concatenate([rendered_mesh, real_rgb_np], axis=1)
-    output_mesh_uint8 = (output_mesh * 255.0).astype(np.uint8)
-
-    # Save using OpenCV, BGR format
-    cv2.imwrite("output_mesh.png", cv2.cvtColor(output_mesh_uint8, cv2.COLOR_RGB2BGR))
-    print("Saved output_mesh.png")
+    n_mesh, n_mesh_f, H_mesh = save_render_matches(
+        rendered_mesh, real_mesh, camera, matcher, "output_mesh.png"
+    )
+    print(
+        f"Saved output_mesh.png ({n_mesh} matches, {n_mesh_f} RANSAC inliers, "
+        f"H={'ok' if H_mesh is not None else 'failed'})"
+    )
 
     # GS test
     print("Running GS test...")
@@ -52,17 +103,15 @@ def main():
 
     gs_scene = GSScene(scene_dir / "gs.ply")
     rendered_gs = gs_scene.render(camera_gs)
+    real_gs = load_real_rgb(rgb_path_gs, camera_gs)
 
-    real_rgb_gs = Image.open(rgb_path_gs).convert("RGB")
-    real_rgb_gs = real_rgb_gs.resize((camera_gs.W, camera_gs.H))
-    real_rgb_np_gs = np.array(real_rgb_gs, dtype=np.float32) / 255.0
-
-    output_gs = np.concatenate([rendered_gs, real_rgb_np_gs], axis=1)
-    output_gs_uint8 = (output_gs * 255.0).astype(np.uint8)
-
-    # Save using OpenCV, BGR format
-    cv2.imwrite("output_gs.png", cv2.cvtColor(output_gs_uint8, cv2.COLOR_RGB2BGR))
-    print("Saved output_gs.png")
+    n_gs, n_gs_f, H_gs = save_render_matches(
+        rendered_gs, real_gs, camera_gs, matcher, "output_gs.png"
+    )
+    print(
+        f"Saved output_gs.png ({n_gs} matches, {n_gs_f} RANSAC inliers, "
+        f"H={'ok' if H_gs is not None else 'failed'})"
+    )
 
 
 if __name__ == "__main__":
