@@ -8,11 +8,14 @@ from scenes.mesh import MeshScene
 from scenes.gs import GSScene
 from features import FeatureMatcher, filter_matches
 from viz import save_match_visualization
+from servo import FixedVelocityController, run_servo_loop
 
 # Resolve paths relative to this file so the smoke test runs from any cwd.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SEED = 42
 FEATURE_METHOD = 'xfeat'
+SERVO_ITERATIONS = 100
+SERVO_VELOCITY = np.array([0.0, 0.0, 0.005, 0.0, 0.0, 0.0], dtype=np.float32)
 
 
 def load_real_rgb(rgb_path, camera):
@@ -64,6 +67,22 @@ def save_render_matches(rendered, real, camera, matcher, output_path):
     return len(kpts1), len(kpts1_f), H_matrix
 
 
+def run_servo_smoke(scene, camera, target, matcher, output_dir):
+    controller = FixedVelocityController(SERVO_VELOCITY)
+    result = run_servo_loop(
+        scene,
+        camera,
+        target,
+        controller,
+        iterations=SERVO_ITERATIONS,
+        visualization_dir=output_dir,
+        matcher=matcher,
+    )
+
+    last = result["history"][-1]
+    return len(result["history"]), last["num_matches"], last["num_inliers"]
+
+
 def main():
     random.seed(SEED)
     np.random.seed(SEED)
@@ -93,6 +112,17 @@ def main():
         f"Saved output_mesh.png ({n_mesh} matches, {n_mesh_f} RANSAC inliers, "
         f"H={'ok' if H_mesh is not None else 'failed'})"
     )
+    n_steps, n_matches, n_inliers = run_servo_smoke(
+        mesh_scene,
+        camera,
+        real_mesh,
+        matcher,
+        PROJECT_ROOT / "servo_mesh",
+    )
+    print(
+        f"Saved servo_mesh/ ({n_steps} iterations, last frame "
+        f"{n_matches} matches, {n_inliers} RANSAC inliers)"
+    )
 
     # GS test
     print("Running GS test...")
@@ -111,6 +141,17 @@ def main():
     print(
         f"Saved output_gs.png ({n_gs} matches, {n_gs_f} RANSAC inliers, "
         f"H={'ok' if H_gs is not None else 'failed'})"
+    )
+    n_steps_gs, n_matches_gs, n_inliers_gs = run_servo_smoke(
+        gs_scene,
+        camera_gs,
+        real_gs,
+        matcher,
+        PROJECT_ROOT / "servo_gs",
+    )
+    print(
+        f"Saved servo_gs/ ({n_steps_gs} iterations, last frame "
+        f"{n_matches_gs} matches, {n_inliers_gs} RANSAC inliers)"
     )
 
 

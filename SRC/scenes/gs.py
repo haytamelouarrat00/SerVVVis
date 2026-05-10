@@ -85,8 +85,11 @@ class GSScene:
         else:
             N = self.xyz.shape[0]
             self.sh_rest = torch.zeros((N, 0, 3), device='cuda')
+        self._last_camera = None
 
     def render(self, camera):
+        self._last_camera = camera
+
         # tan(fov/2) values are used by the rasterizer to recover focal lengths
         # for the screen-space covariance Jacobian: focal = size / (2 * tanfov).
         # Off-center cx, cy is handled via the asymmetric projection matrix below.
@@ -139,3 +142,65 @@ class GSScene:
 
         rendered_image = rendered_image.permute(1, 2, 0).clamp(0, 1)
         return rendered_image.cpu().numpy()
+
+    def render_depth(self, camera=None):
+        if camera is None:
+            camera = self._last_camera
+        if camera is None:
+            raise NotImplementedError("GSScene.render_depth requires a camera")
+
+        tanfovx = camera.W / (2.0 * camera.fx)
+        tanfovy = camera.H / (2.0 * camera.fy)
+
+        T_cam_world = torch.tensor(camera.T_cam_world).float().cuda()
+        viewmatrix = T_cam_world.transpose(0, 1)
+        projmatrix = getProjectionMatrix(
+            znear=0.01, zfar=100.0,
+            fx=camera.fx, fy=camera.fy,
+            cx=camera.cx, cy=camera.cy,
+            W=camera.W, H=camera.H,
+        ).float().transpose(0, 1).cuda()
+
+        full_projmatrix = (viewmatrix.unsqueeze(0).bmm(projmatrix.unsqueeze(0))).squeeze(0)
+
+        campos = torch.tensor(camera.T_world_cam[:3, 3]).float().cuda()
+
+        raster_settings = GaussianRasterizationSettings(
+            image_height=camera.H,
+            image_width=camera.W,
+            tanfovx=tanfovx,
+            tanfovy=tanfovy,
+            bg=torch.zeros(3).cuda(),
+            scale_modifier=1.0,
+            viewmatrix=viewmatrix,
+            projmatrix=full_projmatrix,
+            sh_degree=self.sh_degree,
+            campos=campos,
+            prefiltered=False,
+            debug=False,
+            antialiasing=False
+        )
+
+        rasterizer = GaussianRasterizer(raster_settings)
+
+        ones = torch.ones((self.xyz.shape[0], 1), dtype=self.xyz.dtype, device=self.xyz.device)
+        xyz_h = torch.cat([self.xyz, ones], dim=1)
+        z_cam = (xyz_h @ T_cam_world.T)[:, 2:3]
+        depth_colors = torch.cat([z_cam, z_cam, ones], dim=1)
+
+        outputs = rasterizer(
+            means3D=self.xyz,
+            means2D=torch.zeros_like(self.xyz),
+            shs=None,
+            opacities=self.opacities,
+            scales=self.scales,
+            rotations=self.rotations,
+            colors_precomp=depth_colors
+        )
+        depth_numerator = outputs[0][0]
+        accum_alpha = outputs[0][2]
+        rendered_depth = torch.zeros_like(depth_numerator)
+        valid = accum_alpha > 1e-6
+        rendered_depth[valid] = depth_numerator[valid] / accum_alpha[valid]
+
+        return rendered_depth.detach().cpu().numpy().astype(np.float32, copy=False)
