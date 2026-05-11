@@ -83,8 +83,12 @@ def save_error_evolution(history, path):
             (30, 110, 230),
         ),
         (
-            "pose distance (m)",
-            lambda item: item.get("translation_error_m"),
+            "pose distance (mm)",
+            lambda item: (
+                item.get("translation_error_m") * 1000.0
+                if item.get("translation_error_m") is not None
+                else None
+            ),
             (35, 150, 85),
         ),
         (

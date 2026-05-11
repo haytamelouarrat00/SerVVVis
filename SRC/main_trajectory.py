@@ -10,6 +10,7 @@ GT trajectory, write both as TUM files and evaluate with evo (APE/RPE + plots).
 import argparse
 import csv
 import json
+import re
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -17,31 +18,43 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from camera import Camera
 from controllers import IBVSController
+from dataset import load_colmap, load_scannet
+from experiment_config import (
+    TRAJECTORY_CONFIG_KEYS,
+    apply_config,
+    format_applied_config,
+    load_cli_config,
+)
 from features import FeatureMatcher
 from main_servo_frames import (
     PROJECT_ROOT,
     RUNS_ROOT,
     camera_metadata,
     load_rgb,
-    load_scene_and_frames,
     rotation_error_from_pose,
     save_rgb,
     sorted_frame_ids,
     translation_error_from_pose,
 )
+from scenes.gs import GSScene
+from scenes.mesh import MeshScene
 from servo import SimpleStopper, copy_camera_with_pose, run_servo_loop
 from viz import save_side_by_side
 
 
 # ---- experiment configuration ----------------------------------------------
 DATASETS = ["kitchen"]  # scene folders under DATA/
-RENDERER = "gs"          # "mesh", "gs", or "nerf"
-NERF_POSE_SOURCE = "colmap"  # NERF only: "colmap" or "scannet"
+RENDERER = "mesh"          # "mesh", "gs", or "nerf"
+NERF_POSE_SOURCE = "scannet"  # "colmap" or "scannet" (only used when RENDERER == "nerf")
+NERF_RENDER_SCALE = 0.25  # lower than 1.0 avoids full-res slow NeRF renders
+MESH_PATH = "mesh.ply"  # relative to each scene dir, or absolute
+MESH_POSE_SOURCE = "scannet"  # "scannet" for mesh.ply, "colmap" for COLMAP meshes
 STRIDE = 1               # frames between consecutive mini-servo tasks
 MINI_ITERATIONS = 10     # max iterations per mini servo
 DT = 1.0
-DEPTH_MODE = "learned"  # "learned" or "intrinsic"
+DEPTH_MODE = "intrinsic"  # "learned" or "intrinsic"
 FEATURE_METHOD = "xfeat"
 GAIN = 0.75
 MIN_FEATURES = 3
@@ -51,9 +64,130 @@ MAX_PAIRS = None         # None = all pairs, int = limit number of mini tasks
 EARLY_STOP_ERROR_THRESHOLD = 1e-5
 EARLY_STOP_VELOCITY_GRAD_EPS = 1e-8
 RPE_DELTA = 1            # frames between RPE pose pairs
-RUN_TAG = None           # optional override for the run directory name
+RUN_TAG = "BF_XFEAT_INTRINSIC"        # optional override for the run directory name
 SAVE_TASK_VIZ = True    # save side-by-side (final render | target RGB) per mini task
 TASK_VIZ_EVERY = 1       # save every Nth task only (SAVE_TASK_VIZ must be True)
+
+
+def frame_id_from_path(path):
+    match = re.search(r"(\d+)", Path(path).name)
+    if match is None:
+        raise ValueError(f"Could not parse frame id from {path!r}")
+    return f"frame-{int(match.group(1)):06d}"
+
+
+def make_frame_index(records):
+    index = {}
+    for record in records:
+        if len(record) == 3:
+            camera, rgb_path, _ = record
+        elif len(record) == 2:
+            camera, rgb_path = record
+        else:
+            raise ValueError(f"Unexpected frame record arity: {len(record)}")
+        index[frame_id_from_path(rgb_path)] = {
+            "camera": camera,
+            "rgb_path": rgb_path,
+        }
+    return index
+
+
+def scale_camera(camera, scale):
+    scale = float(scale)
+    if scale == 1.0:
+        return camera
+
+    height = max(1, int(round(camera.H * scale)))
+    width = max(1, int(round(camera.W * scale)))
+    return Camera(
+        camera.T_world_cam,
+        camera.fx * scale,
+        camera.fy * scale,
+        camera.cx * scale,
+        camera.cy * scale,
+        height,
+        width,
+    )
+
+
+def scale_frame_records(records, scale):
+    scale = float(scale)
+    if scale == 1.0:
+        return records
+
+    scaled = []
+    for record in records:
+        if len(record) == 3:
+            camera, rgb_path, depth_path = record
+            scaled.append((scale_camera(camera, scale), rgb_path, depth_path))
+        elif len(record) == 2:
+            camera, rgb_path = record
+            scaled.append((scale_camera(camera, scale), rgb_path))
+        else:
+            raise ValueError(f"Unexpected frame record arity: {len(record)}")
+    return scaled
+
+
+def resolve_scene_asset(scene_dir, path_value):
+    if path_value is None:
+        return scene_dir / "mesh.ply"
+
+    path = Path(str(path_value)).expanduser()
+    if path.is_absolute():
+        return path
+
+    scene_path = scene_dir / path
+    if scene_path.exists():
+        return scene_path
+
+    project_path = PROJECT_ROOT / path
+    if project_path.exists():
+        return project_path
+
+    return scene_path
+
+
+def load_trajectory_scene_and_frames(scene_dir):
+    if RENDERER == "mesh":
+        pose_source = str(MESH_POSE_SOURCE).lower()
+        if pose_source == "scannet":
+            records = load_scannet(scene_dir)
+        elif pose_source == "colmap":
+            records = load_colmap(scene_dir)
+        else:
+            raise ValueError(
+                f"MESH_POSE_SOURCE must be 'scannet' or 'colmap', got {pose_source!r}"
+            )
+        mesh_path = resolve_scene_asset(scene_dir, MESH_PATH)
+        if not mesh_path.exists():
+            raise FileNotFoundError(f"Mesh file not found: {mesh_path}")
+        print(f"Using mesh {mesh_path} with {pose_source} poses")
+        scene = MeshScene(mesh_path)
+    elif RENDERER == "gs":
+        records = load_colmap(scene_dir)
+        scene = GSScene(scene_dir / "gs.ply")
+    elif RENDERER == "nerf":
+        pose_source = str(NERF_POSE_SOURCE).lower()
+        if pose_source == "scannet":
+            records = load_scannet(scene_dir)
+        elif pose_source == "colmap":
+            records = load_colmap(scene_dir)
+        else:
+            raise ValueError(
+                f"NERF_POSE_SOURCE must be 'scannet' or 'colmap', got {pose_source!r}"
+            )
+        records = scale_frame_records(records, NERF_RENDER_SCALE)
+        if float(NERF_RENDER_SCALE) != 1.0:
+            print(f"Using NeRF render scale {float(NERF_RENDER_SCALE):g}")
+        from scenes.nerf import NeRFScene
+        scene = NeRFScene(scene_dir)
+    else:
+        raise ValueError(f"Unknown renderer {RENDERER!r}")
+
+    frame_index = make_frame_index(records)
+    if not frame_index:
+        raise RuntimeError(f"No frames loaded for {RENDERER} from {scene_dir}")
+    return scene, frame_index
 
 
 def pose_to_tum_row(timestamp, T_world_cam):
@@ -303,9 +437,7 @@ def run_scene(scene_name, run_root, resume=False):
     if not scene_dir.exists():
         raise RuntimeError(f"Scene directory not found: {scene_dir}")
 
-    scene, frame_index = load_scene_and_frames(
-        scene_dir, RENDERER, nerf_pose_source=NERF_POSE_SOURCE,
-    )
+    scene, frame_index = load_trajectory_scene_and_frames(scene_dir)
     frame_ids = sorted_frame_ids(frame_index)
     if len(frame_ids) < 1 + STRIDE:
         raise RuntimeError(
@@ -395,7 +527,6 @@ def run_scene(scene_name, run_root, resume=False):
             current_camera.W,
             current_camera.H,
         )
-
         stopper = SimpleStopper(
             error_threshold=EARLY_STOP_ERROR_THRESHOLD,
             velocity_grad_eps=EARLY_STOP_VELOCITY_GRAD_EPS,
@@ -484,9 +615,8 @@ def run_scene(scene_name, run_root, resume=False):
             f"[{scene_name}] task {task_idx:04d}: "
             f"{src_frame_id} -> {tgt_frame_id} "
             f"iters={len(result['history'])}/{MINI_ITERATIONS} "
-            f"stop={result['stop_reason']} "
-            f"trans_err={translation_err:.4f}m "
-            f"rot_err={rotation_err:.4f}deg"
+            f"trans_err={translation_err * 1000.0:.4f}mm "
+            f"rot_err={rotation_err:.8e}deg"
         )
 
         # Chain: next mini task starts from the previous final pose
@@ -512,6 +642,13 @@ def run_scene(scene_name, run_root, resume=False):
         "scene_dir": str(scene_dir),
         "renderer": RENDERER,
         "nerf_pose_source": NERF_POSE_SOURCE,
+        "nerf_render_scale": float(NERF_RENDER_SCALE),
+        "mesh_path": (
+            str(resolve_scene_asset(scene_dir, MESH_PATH))
+            if RENDERER == "mesh"
+            else None
+        ),
+        "mesh_pose_source": MESH_POSE_SOURCE if RENDERER == "mesh" else None,
         "stride": int(STRIDE),
         "mini_iterations": int(MINI_ITERATIONS),
         "depth_mode": DEPTH_MODE,
@@ -539,6 +676,20 @@ def run_scene(scene_name, run_root, resume=False):
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
+        "--config",
+        help="JSON experiment config, resolved relative to CONFIGS/ if needed.",
+    )
+    p.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "Override a config value. May be repeated, e.g. "
+            "--set renderer=mesh --set datasets=kitchen."
+        ),
+    )
+    p.add_argument(
         "--resume",
         nargs="?",
         const="auto",
@@ -554,6 +705,16 @@ def parse_args():
 
 def main():
     args = parse_args()
+    applied_config = load_cli_config(
+        args.config,
+        args.set,
+        TRAJECTORY_CONFIG_KEYS,
+        "trajectory",
+    )
+    apply_config(applied_config, globals(), TRAJECTORY_CONFIG_KEYS)
+    if applied_config:
+        print(f"Applied trajectory config: {format_applied_config(applied_config)}")
+
     tag = RUN_TAG or f"{FEATURE_METHOD}_stride{STRIDE}_iters{MINI_ITERATIONS}"
 
     resume = args.resume is not None

@@ -1,0 +1,22 @@
+{
+  "kind": "trajectory",
+  "datasets": ["kitchen"],
+  "renderer": "mesh",
+  "nerf_pose_source": "colmap",
+  "stride": 1,
+  "mini_iterations": 30,
+  "dt": 1.0,
+  "depth_mode": "learned",
+  "feature_method": "xfeat",
+  "gain": 0.75,
+  "min_features": 3,
+  "ratio": 1,
+  "start_index": 1,
+  "max_pairs": null,
+  "early_stop_error_threshold": 0.00001,
+  "early_stop_velocity_grad_eps": 0.00000001,
+  "rpe_delta": 1,
+  "run_tag": null,
+  "save_task_viz": true,
+  "task_viz_every": 1
+}

@@ -1,3 +1,4 @@
+import argparse
 import csv
 import json
 import re
@@ -9,6 +10,12 @@ from PIL import Image
 
 from controllers import IBVSController
 from dataset import load_colmap, load_scannet
+from experiment_config import (
+    SERVO_FRAMES_CONFIG_KEYS,
+    apply_config,
+    format_applied_config,
+    load_cli_config,
+)
 from features import FeatureMatcher
 from scenes.gs import GSScene
 from scenes.mesh import MeshScene
@@ -21,8 +28,8 @@ RUNS_ROOT = PROJECT_ROOT / "RUNS"
 
 # Edit these values to define the frame-to-frame servo experiment.
 SCENE_DIR = PROJECT_ROOT / "DATA" / "kitchen"
-RENDERER = "gs"  # "mesh", "gs", or "nerf"
-NERF_POSE_SOURCE = "colmap"  # only used when RENDERER == "nerf": "colmap" or "scannet"
+RENDERER = "mesh"  # "mesh", "gs", or "nerf"
+NERF_POSE_SOURCE = "scannet"  # "colmap" or "scannet" (only used when RENDERER == "nerf")
 START_INDEX = 1
 INDEX_AWAY = 1
 TARGET_INDEX = None
@@ -37,6 +44,25 @@ RATIO = 1 # 0 = match once then reproject forever; N = re-match every Nth iter.
 RUN_NAME = None
 EARLY_STOP_ERROR_THRESHOLD = 1e-5
 EARLY_STOP_VELOCITY_GRAD_EPS = 1e-8
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument(
+        "--config",
+        help="JSON experiment config, resolved relative to CONFIGS/ if needed.",
+    )
+    p.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "Override a config value. May be repeated, e.g. "
+            "--set renderer=mesh --set scene=kitchen."
+        ),
+    )
+    return p.parse_args()
 
 
 def normalize_frame_id(value):
@@ -137,7 +163,7 @@ def resolve_frame_from_index(frame_index, renderer, logical_index):
 def load_scene_and_frames(scene_dir, renderer, nerf_pose_source=None):
     if renderer == "mesh":
         records = load_scannet(scene_dir)
-        scene = MeshScene(scene_dir / "mesh.ply")
+        scene = MeshScene(scene_dir / "poisson.ply")
     elif renderer == "gs":
         records = load_colmap(scene_dir)
         scene = GSScene(scene_dir / "gs.ply")
@@ -151,8 +177,6 @@ def load_scene_and_frames(scene_dir, renderer, nerf_pose_source=None):
             raise ValueError(
                 f"NERF_POSE_SOURCE must be 'colmap' or 'scannet', got {source!r}"
             )
-        # Lazy import: torch-ngp pulls heavy deps (lpips, raymarching, ...)
-        # that only the NeRF renderer needs.
         from scenes.nerf import NeRFScene
         scene = NeRFScene(scene_dir)
     else:
@@ -399,10 +423,25 @@ def experiment_config(
 
 
 def main():
+    args = parse_args()
+    applied_config = load_cli_config(
+        args.config,
+        args.set,
+        SERVO_FRAMES_CONFIG_KEYS,
+        "servo_frames",
+    )
+    apply_config(applied_config, globals(), SERVO_FRAMES_CONFIG_KEYS)
+    if applied_config:
+        print(f"Applied servo config: {format_applied_config(applied_config)}")
+
     if DEPTH_MODE not in ("learned", "intrinsic"):
         raise ValueError("DEPTH_MODE must be 'learned' or 'intrinsic'")
 
-    scene, frame_index = load_scene_and_frames(SCENE_DIR, RENDERER)
+    scene, frame_index = load_scene_and_frames(
+        SCENE_DIR,
+        RENDERER,
+        nerf_pose_source=NERF_POSE_SOURCE,
+    )
     start_index = int(START_INDEX)
     target_index = resolve_target_index(start_index, TARGET_INDEX, INDEX_AWAY)
     start_frame = resolve_frame_from_index(frame_index, RENDERER, start_index)
@@ -466,7 +505,7 @@ def main():
             f"iter {item['iteration']:04d}: "
             f"mode={info.get('feature_mode')} "
             f"error_norm={residual:.6f} "
-            f"pose_distance={translation_error:.4f}m "
+            f"pose_distance={translation_error * 1000.0:.4f}mm "
             f"rotation_distance={rotation_error:.4f}deg "
             f"cached={info.get('num_cached_features', 0)} "
             f"dropped={info.get('num_dropped_features', 0)} "
@@ -593,8 +632,8 @@ def main():
         f"stop={result['stop_reason']}"
     )
     print(
-        f"Translation error: {initial_translation_error:.4f}m -> "
-        f"{final_translation_error:.4f}m"
+        f"Translation error: {initial_translation_error * 1000.0:.4f}mm -> "
+        f"{final_translation_error * 1000.0:.4f}mm"
     )
     print(
         f"Rotation error: {initial_rotation_error:.4f}deg -> "

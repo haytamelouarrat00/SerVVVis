@@ -1,0 +1,51 @@
+# Local secrets and environment files
+.env
+.env.*
+*.env
+!.env.example
+!*.env.example
+CONFIGS/bot.env
+CONFIGS/*.local.json
+
+# Python caches and test/build output
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Local IDE/editor metadata
+.idea/
+.vscode/
+.claude/
+.DS_Store
+*.swp
+*.swo
+*~
+.ipynb_checkpoints/
+
+# Large local datasets and generated experiment artifacts
+DATA/
+RUNS/
+depth_comparison/
+servo_mesh/
+servo_gs/
+kitchen-instant-ngp-tcnn/
+
+# Generated smoke-test/render outputs
+output_mesh.png
+output_gs.png
+SRC/output_mesh.png
+SRC/output_gs.png
+*.npy
+*.npz
+
+# Logs and process output
+*.log
+logs/
