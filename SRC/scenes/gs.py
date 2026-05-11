@@ -85,7 +85,26 @@ class GSScene:
         else:
             N = self.xyz.shape[0]
             self.sh_rest = torch.zeros((N, 0, 3), device='cuda')
+
+        # Static per-render buffers that never change across calls.
+        self._shs = torch.cat([self.sh_dc, self.sh_rest], dim=1).contiguous()
+        self._means2D = torch.zeros_like(self.xyz)
+        self._bg = torch.zeros(3, device='cuda')
+        self._proj_cache = {}
         self._last_camera = None
+
+    def _get_proj(self, fx, fy, cx, cy, W, H):
+        key = (fx, fy, cx, cy, W, H)
+        proj = self._proj_cache.get(key)
+        if proj is None:
+            proj = (
+                getProjectionMatrix(0.01, 100.0, fx, fy, cx, cy, W, H)
+                .float()
+                .transpose(0, 1)
+                .cuda()
+            )
+            self._proj_cache[key] = proj
+        return proj
 
     def render(self, camera):
         self._last_camera = camera
@@ -96,25 +115,31 @@ class GSScene:
         tanfovx = camera.W / (2.0 * camera.fx)
         tanfovy = camera.H / (2.0 * camera.fy)
 
-        viewmatrix = torch.tensor(camera.T_cam_world).float().transpose(0, 1).cuda()
-        projmatrix = getProjectionMatrix(
-            znear=0.01, zfar=100.0,
-            fx=camera.fx, fy=camera.fy,
-            cx=camera.cx, cy=camera.cy,
-            W=camera.W, H=camera.H,
-        ).float().transpose(0, 1).cuda()
+        viewmatrix = (
+            torch.from_numpy(np.ascontiguousarray(camera.T_cam_world))
+            .float()
+            .transpose(0, 1)
+            .cuda(non_blocking=True)
+        )
+        projmatrix = self._get_proj(
+            camera.fx, camera.fy, camera.cx, camera.cy, camera.W, camera.H
+        )
 
         # Pytorch's bmm expects (B, N, M), we unsqueeze and squeeze
         full_projmatrix = (viewmatrix.unsqueeze(0).bmm(projmatrix.unsqueeze(0))).squeeze(0)
 
-        campos = torch.tensor(camera.T_world_cam[:3, 3]).float().cuda()
+        campos = (
+            torch.from_numpy(np.ascontiguousarray(camera.T_world_cam[:3, 3]))
+            .float()
+            .cuda(non_blocking=True)
+        )
 
         raster_settings = GaussianRasterizationSettings(
             image_height=camera.H,
             image_width=camera.W,
             tanfovx=tanfovx,
             tanfovy=tanfovy,
-            bg=torch.zeros(3).cuda(),
+            bg=self._bg,
             scale_modifier=1.0,
             viewmatrix=viewmatrix,
             projmatrix=full_projmatrix,
@@ -127,12 +152,10 @@ class GSScene:
 
         rasterizer = GaussianRasterizer(raster_settings)
 
-        shs = torch.cat([self.sh_dc, self.sh_rest], dim=1)
-
         outputs = rasterizer(
             means3D=self.xyz,
-            means2D=torch.zeros_like(self.xyz),
-            shs=shs,
+            means2D=self._means2D,
+            shs=self._shs,
             opacities=self.opacities,
             scales=self.scales,
             rotations=self.rotations,
@@ -152,25 +175,30 @@ class GSScene:
         tanfovx = camera.W / (2.0 * camera.fx)
         tanfovy = camera.H / (2.0 * camera.fy)
 
-        T_cam_world = torch.tensor(camera.T_cam_world).float().cuda()
+        T_cam_world = (
+            torch.from_numpy(np.ascontiguousarray(camera.T_cam_world))
+            .float()
+            .cuda(non_blocking=True)
+        )
         viewmatrix = T_cam_world.transpose(0, 1)
-        projmatrix = getProjectionMatrix(
-            znear=0.01, zfar=100.0,
-            fx=camera.fx, fy=camera.fy,
-            cx=camera.cx, cy=camera.cy,
-            W=camera.W, H=camera.H,
-        ).float().transpose(0, 1).cuda()
+        projmatrix = self._get_proj(
+            camera.fx, camera.fy, camera.cx, camera.cy, camera.W, camera.H
+        )
 
         full_projmatrix = (viewmatrix.unsqueeze(0).bmm(projmatrix.unsqueeze(0))).squeeze(0)
 
-        campos = torch.tensor(camera.T_world_cam[:3, 3]).float().cuda()
+        campos = (
+            torch.from_numpy(np.ascontiguousarray(camera.T_world_cam[:3, 3]))
+            .float()
+            .cuda(non_blocking=True)
+        )
 
         raster_settings = GaussianRasterizationSettings(
             image_height=camera.H,
             image_width=camera.W,
             tanfovx=tanfovx,
             tanfovy=tanfovy,
-            bg=torch.zeros(3).cuda(),
+            bg=self._bg,
             scale_modifier=1.0,
             viewmatrix=viewmatrix,
             projmatrix=full_projmatrix,
@@ -190,7 +218,7 @@ class GSScene:
 
         outputs = rasterizer(
             means3D=self.xyz,
-            means2D=torch.zeros_like(self.xyz),
+            means2D=self._means2D,
             shs=None,
             opacities=self.opacities,
             scales=self.scales,

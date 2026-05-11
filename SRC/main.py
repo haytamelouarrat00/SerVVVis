@@ -24,30 +24,11 @@ def load_real_rgb(rgb_path, camera):
     return np.array(real_rgb, dtype=np.float32) / 255.0
 
 
-def split_removed_matches(kpts1, kpts2, kpts1_kept, kpts2_kept):
-    kept_mask = np.zeros(len(kpts1), dtype=bool)
-    kept_idx = 0
-
-    for i in range(len(kpts1)):
-        if kept_idx >= len(kpts1_kept):
-            break
-        if (
-            np.allclose(kpts1[i], kpts1_kept[kept_idx])
-            and np.allclose(kpts2[i], kpts2_kept[kept_idx])
-        ):
-            kept_mask[i] = True
-            kept_idx += 1
-
-    if kept_idx != len(kpts1_kept):
-        raise RuntimeError("Filtered keypoints are not an ordered subset of matches")
-
-    return kpts1[~kept_mask], kpts2[~kept_mask]
-
-
 def save_render_matches(rendered, real, camera, matcher, output_path):
     kpts1, kpts2 = matcher.match(rendered, real)
-    kpts1_f, kpts2_f, H_matrix, _, _ = filter_matches(kpts1, kpts2, camera)
-    kpts1_removed, kpts2_removed = split_removed_matches(kpts1, kpts2, kpts1_f, kpts2_f)
+    kpts1_f, kpts2_f, H_matrix, _, _, inliers = filter_matches(kpts1, kpts2, camera)
+    kpts1_removed = kpts1[~inliers]
+    kpts2_removed = kpts2[~inliers]
 
     matches_removed = [(i, i) for i in range(len(kpts1_removed))]
     matches_kept = [(i, i) for i in range(len(kpts1_f))]

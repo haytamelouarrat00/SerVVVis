@@ -1,3 +1,12 @@
+"""Image-based visual servo controller (Chaumette & Hutchinson, 2006, Part I).
+
+Implements the basic IBVS scheme:
+    e   = s - s*                                     (paper eq. 1)
+    s   = stacked normalized image points (x, y)     (paper eq. 6)
+    L_x = per-point interaction matrix               (paper eq. 11)
+    v_c = -lambda * pinv(L_e) * e                    (paper eq. 5)
+"""
+
 import numpy as np
 
 from depth import get_depth
@@ -5,11 +14,11 @@ from features import FeatureMatcher, filter_matches
 
 
 def normalize_points(kpts, camera):
+    """Pixels -> normalized image coordinates (x, y) = ((u-cu)/f, (v-cv)/f)."""
     kpts = np.asarray(kpts, dtype=np.float32).reshape(-1, 2)
-    points = np.empty_like(kpts)
-    points[:, 0] = (kpts[:, 0] - camera.cx) / camera.fx
-    points[:, 1] = (kpts[:, 1] - camera.cy) / camera.fy
-    return points
+    center = np.array([camera.cx, camera.cy], dtype=np.float32)
+    inv_focal = np.array([1.0 / camera.fx, 1.0 / camera.fy], dtype=np.float32)
+    return (kpts - center) * inv_focal
 
 
 def sample_depth_nearest(depth, kpts, min_depth=1e-4):
@@ -37,36 +46,33 @@ def backproject_pixels(kpts, depths, camera):
     if len(kpts) != len(depths):
         raise ValueError("kpts and depths must have the same length")
 
-    x = (kpts[:, 0] - camera.cx) / camera.fx
-    y = (kpts[:, 1] - camera.cy) / camera.fy
-
+    norm = normalize_points(kpts, camera)
     points_cam = np.empty((len(kpts), 3), dtype=np.float32)
-    points_cam[:, 0] = x * depths
-    points_cam[:, 1] = y * depths
+    points_cam[:, :2] = norm * depths[:, None]
     points_cam[:, 2] = depths
     return points_cam
 
 
 def camera_points_to_world(points_cam, camera):
     points_cam = np.asarray(points_cam, dtype=np.float32).reshape(-1, 3)
-    ones = np.ones((len(points_cam), 1), dtype=np.float32)
-    points_cam_h = np.concatenate([points_cam, ones], axis=1)
-    points_world_h = points_cam_h @ camera.T_world_cam.T
-    return points_world_h[:, :3].astype(np.float32, copy=False)
+    R = camera.T_world_cam[:3, :3]
+    t = camera.T_world_cam[:3, 3]
+    return (points_cam @ R.T + t).astype(np.float32, copy=False)
 
 
 def project_world_points(points_world, camera, min_depth=1e-4):
     points_world = np.asarray(points_world, dtype=np.float32).reshape(-1, 3)
-    ones = np.ones((len(points_world), 1), dtype=np.float32)
-    points_world_h = np.concatenate([points_world, ones], axis=1)
-    points_cam_h = points_world_h @ camera.T_cam_world.T
-    points_cam = points_cam_h[:, :3]
+    R = camera.T_cam_world[:3, :3]
+    t = camera.T_cam_world[:3, 3]
+    points_cam = points_world @ R.T + t
     depths = points_cam[:, 2]
 
     valid = np.isfinite(points_cam).all(axis=1) & (depths > float(min_depth))
     pixels = np.zeros((len(points_world), 2), dtype=np.float32)
-    pixels[valid, 0] = camera.fx * (points_cam[valid, 0] / depths[valid]) + camera.cx
-    pixels[valid, 1] = camera.fy * (points_cam[valid, 1] / depths[valid]) + camera.cy
+    safe_depth = np.where(valid, depths, 1.0)
+    pixels[:, 0] = camera.fx * (points_cam[:, 0] / safe_depth) + camera.cx
+    pixels[:, 1] = camera.fy * (points_cam[:, 1] / safe_depth) + camera.cy
+    pixels[~valid] = 0.0
     valid &= (
         np.isfinite(pixels).all(axis=1)
         & (pixels[:, 0] >= 0.0)
@@ -74,11 +80,11 @@ def project_world_points(points_world, camera, min_depth=1e-4):
         & (pixels[:, 1] >= 0.0)
         & (pixels[:, 1] < camera.H)
     )
-
     return pixels, depths.astype(np.float32, copy=False), valid
 
 
 def point_interaction_matrix(points, depths):
+    """Stack per-point L_x (paper eq. 11). Input points are normalized (x, y)."""
     points = np.asarray(points, dtype=np.float32).reshape(-1, 2)
     depths = np.asarray(depths, dtype=np.float32).reshape(-1)
     if len(points) != len(depths):
@@ -104,76 +110,50 @@ def point_interaction_matrix(points, depths):
     return L
 
 
-def damped_least_squares_velocity(L, error, gain, damping):
-    L = np.asarray(L, dtype=np.float32)
-    error = np.asarray(error, dtype=np.float32).reshape(-1)
+class IBVSController:
+    """Paper IBVS with optional feature-cache refresh ratio.
 
-    H = L.T @ L
-    diagonal = np.diag(H).copy()
-    diagonal = np.maximum(diagonal, 1e-8)
-    A = H + float(damping) * np.diag(diagonal)
-    b = L.T @ error
+    `ratio` controls when features are re-matched:
+        ratio = 1  -> re-match every iteration (paper default)
+        ratio = N  -> re-match every Nth iteration; reproject cached 3D points between
+        ratio = 0  -> match once on first call, reproject forever
+    """
 
-    try:
-        velocity = -float(gain) * np.linalg.solve(A, b)
-    except np.linalg.LinAlgError:
-        velocity = -float(gain) * np.linalg.lstsq(A, b, rcond=None)[0]
-
-    return velocity.astype(np.float32)
-
-
-def clip_velocity(velocity, max_translation=None, max_rotation=None):
-    velocity = np.asarray(velocity, dtype=np.float32).copy()
-
-    if max_translation is not None:
-        norm = float(np.linalg.norm(velocity[:3]))
-        if norm > max_translation:
-            velocity[:3] *= float(max_translation) / norm
-
-    if max_rotation is not None:
-        norm = float(np.linalg.norm(velocity[3:]))
-        if norm > max_rotation:
-            velocity[3:] *= float(max_rotation) / norm
-
-    return velocity
-
-
-class GeometricFeatureController:
     def __init__(
         self,
         matcher=None,
         feature_method="xfeat",
         gain=0.5,
-        damping=1e-3,
-        max_features=200,
-        min_features=4,
+        min_features=3,
         min_depth=1e-4,
-        max_translation_velocity=0.05,
-        max_rotation_velocity=0.05,
         depth_provider=None,
         scene=None,
         use_intrinsic_depth=False,
         ratio=1,
+        damping=0.01,
+        adaptive_gain=True,
+        velocity_alpha=0.8,
     ):
         if int(ratio) < 0:
             raise ValueError("ratio must be >= 0")
         self.matcher = matcher if matcher is not None else FeatureMatcher(method=feature_method)
         self.gain = float(gain)
-        self.damping = float(damping)
-        self.max_features = None if max_features is None else int(max_features)
         self.min_features = int(min_features)
         self.min_depth = float(min_depth)
-        self.max_translation_velocity = max_translation_velocity
-        self.max_rotation_velocity = max_rotation_velocity
         self.depth_provider = depth_provider
         self.scene = scene
         self.use_intrinsic_depth = bool(use_intrinsic_depth)
         self.ratio = int(ratio)
+        self.damping = float(damping)
+        self.adaptive_gain = bool(adaptive_gain)
+        self.velocity_alpha = float(velocity_alpha)
+
         self.cached_points_world = None
         self.cached_target_kpts = None
         self.cache_refresh_iteration = None
         self.last_info = {}
         self.last_visualization = {}
+        self.prev_velocity = None
 
     def _depth(self, rendered):
         if self.depth_provider is not None:
@@ -185,45 +165,35 @@ class GeometricFeatureController:
         )
 
     def _should_refresh(self, iteration):
-        if self.cached_points_world is None or self.cached_target_kpts is None:
+        if self.cached_points_world is None:
             return True
         if self.ratio == 0:
             return False
         return int(iteration) % self.ratio == 0
 
-    def _refresh_features(self, rendered, target, camera, iteration):
+    def _refresh(self, rendered, target, camera, iteration):
         kpts_current, kpts_target = self.matcher.match(rendered, target)
-        num_raw_matches = len(kpts_current)
-        kpts_current, kpts_target, H_matrix, _, _ = filter_matches(
+        num_raw = len(kpts_current)
+        kpts_current, kpts_target, _, _, _, _ = filter_matches(
             kpts_current,
             kpts_target,
             camera,
         )
 
-        if len(kpts_current) < self.min_features:
-            raise RuntimeError(
-                f"Geometric controller needs at least {self.min_features} inlier "
-                f"matches, got {len(kpts_current)}"
-            )
-
-        if self.max_features is not None and len(kpts_current) > self.max_features:
-            kpts_current = kpts_current[:self.max_features]
-            kpts_target = kpts_target[:self.max_features]
-
-        depth = self._depth(rendered)
-        depths, valid_depth = sample_depth_nearest(
-            depth,
+        depth_map = self._depth(rendered)
+        depths, valid = sample_depth_nearest(
+            depth_map,
             kpts_current,
             min_depth=self.min_depth,
         )
-        kpts_current = kpts_current[valid_depth]
-        kpts_target = kpts_target[valid_depth]
-        depths = depths[valid_depth]
+        kpts_current = kpts_current[valid]
+        kpts_target = kpts_target[valid]
+        depths = depths[valid]
 
         if len(kpts_current) < self.min_features:
             raise RuntimeError(
-                f"Geometric controller needs at least {self.min_features} valid "
-                f"depth matches, got {len(kpts_current)}"
+                f"IBVS needs at least {self.min_features} matches with valid "
+                f"depth, got {len(kpts_current)}"
             )
 
         points_cam = backproject_pixels(kpts_current, depths, camera)
@@ -233,99 +203,96 @@ class GeometricFeatureController:
 
         return {
             "mode": "refresh",
+            "num_raw_matches": int(num_raw),
             "kpts_current": kpts_current,
             "kpts_target": kpts_target,
             "depths": depths,
-            "homography_ok": H_matrix is not None,
-            "num_raw_matches": int(num_raw_matches),
-            "num_cached_before": int(len(kpts_current)),
             "num_dropped_features": 0,
-            "num_reprojected_valid": int(len(kpts_current)),
         }
 
-    def _reproject_features(self, camera):
+    def _reproject(self, rendered, camera):
         cached_before = len(self.cached_points_world)
-        kpts_current, depths, valid = project_world_points(
+        kpts_current, depths_geom, valid = project_world_points(
             self.cached_points_world,
             camera,
             min_depth=self.min_depth,
         )
-
-        self.cached_points_world = self.cached_points_world[valid]
-        self.cached_target_kpts = self.cached_target_kpts[valid]
         kpts_current = kpts_current[valid]
-        depths = depths[valid]
-        kpts_target = self.cached_target_kpts.copy()
+        depths = depths_geom[valid]
+        kpts_target = self.cached_target_kpts[valid].copy()
+
+        # With intrinsic (exact) depth from the scene, sample current depth at
+        # the reprojected pixels instead of using the geometric Zc. Closer to the
+        # paper's L_x (uses current observed Z) and catches occlusion / surface
+        # changes. With learned depth we trust the cached 3D point's geometric
+        # Zc more than a noisy depth map.
+        if self.use_intrinsic_depth and len(kpts_current) > 0:
+            depth_map = self._depth(rendered)
+            measured, valid_z = sample_depth_nearest(
+                depth_map,
+                kpts_current,
+                min_depth=self.min_depth,
+            )
+            kpts_current = kpts_current[valid_z]
+            kpts_target = kpts_target[valid_z]
+            depths = measured[valid_z]
 
         if len(kpts_current) < self.min_features:
             raise RuntimeError(
-                f"Geometric controller needs at least {self.min_features} "
-                f"reprojected features, got {len(kpts_current)}"
+                f"IBVS needs at least {self.min_features} reprojected features, "
+                f"got {len(kpts_current)}"
             )
 
         return {
             "mode": "reproject",
+            "num_raw_matches": int(cached_before),
             "kpts_current": kpts_current,
             "kpts_target": kpts_target,
             "depths": depths,
-            "homography_ok": None,
-            "num_raw_matches": int(cached_before),
-            "num_cached_before": int(cached_before),
             "num_dropped_features": int(cached_before - len(kpts_current)),
-            "num_reprojected_valid": int(len(kpts_current)),
         }
 
     def __call__(self, rendered, target, camera, iteration):
         if self._should_refresh(iteration):
-            feature_state = self._refresh_features(rendered, target, camera, iteration)
+            state = self._refresh(rendered, target, camera, iteration)
         else:
-            feature_state = self._reproject_features(camera)
+            state = self._reproject(rendered, camera)
 
-        kpts_current = feature_state["kpts_current"]
-        kpts_target = feature_state["kpts_target"]
-        depths = feature_state["depths"]
+        kpts_current = state["kpts_current"]
+        kpts_target = state["kpts_target"]
+        depths = state["depths"]
 
-        current_norm = normalize_points(kpts_current, camera)
-        target_norm = normalize_points(kpts_target, camera)
-        error = (current_norm - target_norm).reshape(-1)
+        # Normalize image coordinates (paper eq. 6).
+        x = normalize_points(kpts_current, camera)
+        x_star = normalize_points(kpts_target, camera)
+        error = (x - x_star).reshape(-1)
 
-        L = point_interaction_matrix(current_norm, depths)
-        velocity = damped_least_squares_velocity(
-            L,
-            error,
-            gain=self.gain,
-            damping=self.damping,
-        )
-        velocity = clip_velocity(
-            velocity,
-            max_translation=self.max_translation_velocity,
-            max_rotation=self.max_rotation_velocity,
-        )
+        # Build L_e from current points + current depths (paper eq. 11).
+        L = point_interaction_matrix(x, depths)
+
+        # Control law: v_c = -lambda * pinv(L_e) * e (paper eq. 5).
+        velocity = (-self.gain * (np.linalg.pinv(L) @ error)).astype(np.float32)
 
         self.last_info = {
             "iteration": int(iteration),
-            "feature_mode": feature_state["mode"],
+            "feature_mode": state["mode"],
             "ratio": self.ratio,
             "cache_refresh_iteration": self.cache_refresh_iteration,
-            "num_raw_matches": feature_state["num_raw_matches"],
-            "num_cached_features": int(len(self.cached_points_world)),
-            "num_cached_before": feature_state["num_cached_before"],
-            "num_reprojected_valid": feature_state["num_reprojected_valid"],
-            "num_dropped_features": feature_state["num_dropped_features"],
+            "num_raw_matches": state["num_raw_matches"],
             "num_inlier_matches": int(len(kpts_current)),
-            "homography_ok": feature_state["homography_ok"],
+            "num_cached_features": int(len(self.cached_points_world)),
+            "num_dropped_features": state["num_dropped_features"],
             "residual_norm": float(np.linalg.norm(error)),
+            "velocity_norm": float(np.linalg.norm(velocity)),
             "mean_depth_m": float(np.mean(depths)),
             "min_depth_m": float(np.min(depths)),
             "max_depth_m": float(np.max(depths)),
-            "velocity_norm": float(np.linalg.norm(velocity)),
         }
         self.last_visualization = {
             "iteration": int(iteration),
-            "feature_mode": feature_state["mode"],
-            "num_raw_matches": feature_state["num_raw_matches"],
+            "feature_mode": state["mode"],
+            "num_raw_matches": state["num_raw_matches"],
             "kpts_current": kpts_current.copy(),
             "kpts_target": kpts_target.copy(),
         }
-
         return velocity

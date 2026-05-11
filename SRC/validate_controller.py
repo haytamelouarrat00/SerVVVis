@@ -2,7 +2,7 @@ import numpy as np
 
 from camera import Camera
 from controllers import (
-    GeometricFeatureController,
+    IBVSController,
     normalize_points,
     point_interaction_matrix,
 )
@@ -58,11 +58,9 @@ def test_zero_error_returns_zero_velocity():
     camera = make_camera()
     rendered = np.zeros((64, 64, 3), dtype=np.float32)
     target = rendered.copy()
-    controller = GeometricFeatureController(
+    controller = IBVSController(
         matcher=DummyMatcher(offset=(0.0, 0.0)),
         depth_provider=constant_depth,
-        max_translation_velocity=None,
-        max_rotation_velocity=None,
     )
 
     velocity = controller(rendered, target, camera, iteration=0)
@@ -74,11 +72,9 @@ def test_shifted_features_return_finite_velocity():
     camera = make_camera()
     rendered = np.zeros((64, 64, 3), dtype=np.float32)
     target = rendered.copy()
-    controller = GeometricFeatureController(
+    controller = IBVSController(
         matcher=DummyMatcher(offset=(2.0, -1.0)),
         depth_provider=constant_depth,
-        max_translation_velocity=0.05,
-        max_rotation_velocity=0.05,
     )
 
     velocity = controller(rendered, target, camera, iteration=0)
@@ -90,32 +86,48 @@ def test_shifted_features_return_finite_velocity():
         raise AssertionError("Controller did not record enough inlier matches")
 
 
-def test_ratio_zero_refreshes_once_then_reprojects():
+def test_ratio_one_matches_every_iteration():
     camera = make_camera()
     rendered = np.zeros((64, 64, 3), dtype=np.float32)
     target = rendered.copy()
     matcher = DummyMatcher(offset=(0.0, 0.0))
-    controller = GeometricFeatureController(
+    controller = IBVSController(
+        matcher=matcher,
+        depth_provider=constant_depth,
+        ratio=1,
+    )
+
+    for iteration in range(3):
+        controller(rendered, target, camera, iteration=iteration)
+
+    if matcher.call_count != 3:
+        raise AssertionError(
+            f"ratio=1 expects 3 matcher calls, got {matcher.call_count}"
+        )
+
+
+def test_ratio_zero_matches_once_then_reprojects():
+    camera = make_camera()
+    rendered = np.zeros((64, 64, 3), dtype=np.float32)
+    target = rendered.copy()
+    matcher = DummyMatcher(offset=(0.0, 0.0))
+    controller = IBVSController(
         matcher=matcher,
         depth_provider=constant_depth,
         ratio=0,
-        max_translation_velocity=None,
-        max_rotation_velocity=None,
     )
 
     controller(rendered, target, camera, iteration=0)
     if controller.last_info["feature_mode"] != "refresh":
-        raise AssertionError("ratio=0 should refresh on the first iteration")
+        raise AssertionError("ratio=0 should refresh on first iteration")
     if matcher.call_count != 1:
-        raise AssertionError("Initial refresh should call the matcher once")
+        raise AssertionError("Initial refresh should call matcher once")
 
     controller(rendered, target, camera, iteration=1)
     if controller.last_info["feature_mode"] != "reproject":
-        raise AssertionError("ratio=0 should reproject after the first iteration")
+        raise AssertionError("ratio=0 should reproject after first iteration")
     if matcher.call_count != 1:
-        raise AssertionError("ratio=0 reproject iteration should not call matcher")
-    if controller.last_info["num_dropped_features"] != 0:
-        raise AssertionError("Same-pose reprojection should not drop features")
+        raise AssertionError("ratio=0 reproject should not call matcher")
 
 
 def test_ratio_n_refreshes_every_n_iterations():
@@ -123,12 +135,10 @@ def test_ratio_n_refreshes_every_n_iterations():
     rendered = np.zeros((64, 64, 3), dtype=np.float32)
     target = rendered.copy()
     matcher = DummyMatcher(offset=(0.0, 0.0))
-    controller = GeometricFeatureController(
+    controller = IBVSController(
         matcher=matcher,
         depth_provider=constant_depth,
         ratio=2,
-        max_translation_velocity=None,
-        max_rotation_velocity=None,
     )
 
     controller(rendered, target, camera, iteration=0)
@@ -146,9 +156,10 @@ def main():
     test_interaction_matrix_shape()
     test_zero_error_returns_zero_velocity()
     test_shifted_features_return_finite_velocity()
-    test_ratio_zero_refreshes_once_then_reprojects()
+    test_ratio_one_matches_every_iteration()
+    test_ratio_zero_matches_once_then_reprojects()
     test_ratio_n_refreshes_every_n_iterations()
-    print("Geometric controller validation passed")
+    print("IBVS controller validation passed")
 
 
 if __name__ == "__main__":

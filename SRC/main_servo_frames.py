@@ -1,43 +1,42 @@
 import csv
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
-from controllers import GeometricFeatureController
+from controllers import IBVSController
 from dataset import load_colmap, load_scannet
 from features import FeatureMatcher
 from scenes.gs import GSScene
 from scenes.mesh import MeshScene
-from servo import run_servo_loop
+from servo import SimpleStopper, run_servo_loop
 from viz import save_error_evolution
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RUNS_ROOT = PROJECT_ROOT / "RUNS"
-CONTROLLER_DIR = "FBVS"
 
 # Edit these values to define the frame-to-frame servo experiment.
 SCENE_DIR = PROJECT_ROOT / "DATA" / "kitchen"
-RENDERER = "gs"  # "mesh" or "gs"
-START_INDEX = 34
-INDEX_AWAY = 50
-TARGET_INDEX = None  # Set to an integer to override START_INDEX + INDEX_AWAY.
+RENDERER = "gs"  # "mesh", "gs", or "nerf"
+NERF_POSE_SOURCE = "colmap"  # only used when RENDERER == "nerf": "colmap" or "scannet"
+START_INDEX = 1
+INDEX_AWAY = 1
+TARGET_INDEX = None
 ITERATIONS = 100
 DT = 1.0
 DEPTH_MODE = "intrinsic"  # "learned" = MoGe2, "intrinsic" = scene.render_depth()
-FEATURE_METHOD = "xfeat"
-RATIO = 1  # 0 = refresh once, N = refresh every Nth iteration.
+FEATURE_METHOD = "sift"
 VIZ_ITER = 1  # Save visualization every VIZ_ITER iterations. 0 disables images.
-GAIN = 1
-DAMPING = 1e-3
-MAX_FEATURES = 200
-MIN_FEATURES = 4
-MAX_TRANSLATION_VELOCITY = 1
-MAX_ROTATION_VELOCITY = 1
+GAIN = 0.75
+MIN_FEATURES = 3
+RATIO = 1 # 0 = match once then reproject forever; N = re-match every Nth iter.
 RUN_NAME = None
+EARLY_STOP_ERROR_THRESHOLD = 1e-5
+EARLY_STOP_VELOCITY_GRAD_EPS = 1e-8
 
 
 def normalize_frame_id(value):
@@ -72,10 +71,16 @@ def save_rgb(path, image):
 def make_frame_index(records, renderer):
     index = {}
     for record in records:
-        if renderer == "mesh":
+        # ScanNet loader emits (camera, rgb_path, depth_path); COLMAP loader
+        # emits (camera, rgb_path). Accept either shape.
+        if len(record) == 3:
             camera, rgb_path, _ = record
-        else:
+        elif len(record) == 2:
             camera, rgb_path = record
+        else:
+            raise ValueError(
+                f"Unexpected record arity {len(record)} for renderer {renderer!r}"
+            )
         index[frame_id_from_path(rgb_path)] = {
             "camera": camera,
             "rgb_path": rgb_path,
@@ -129,13 +134,27 @@ def resolve_frame_from_index(frame_index, renderer, logical_index):
     return frame_ids[position]
 
 
-def load_scene_and_frames(scene_dir, renderer):
+def load_scene_and_frames(scene_dir, renderer, nerf_pose_source=None):
     if renderer == "mesh":
         records = load_scannet(scene_dir)
         scene = MeshScene(scene_dir / "mesh.ply")
     elif renderer == "gs":
         records = load_colmap(scene_dir)
         scene = GSScene(scene_dir / "gs.ply")
+    elif renderer == "nerf":
+        source = (nerf_pose_source or NERF_POSE_SOURCE).lower()
+        if source == "scannet":
+            records = load_scannet(scene_dir)
+        elif source == "colmap":
+            records = load_colmap(scene_dir)
+        else:
+            raise ValueError(
+                f"NERF_POSE_SOURCE must be 'colmap' or 'scannet', got {source!r}"
+            )
+        # Lazy import: torch-ngp pulls heavy deps (lpips, raymarching, ...)
+        # that only the NeRF renderer needs.
+        from scenes.nerf import NeRFScene
+        scene = NeRFScene(scene_dir)
     else:
         raise ValueError(f"Unknown renderer {renderer!r}")
 
@@ -181,7 +200,6 @@ def write_history_csv(path, history):
         "rotation_error_deg",
         "cached_features",
         "dropped_features",
-        "reprojected_valid",
         "mean_depth_m",
         "min_depth_m",
         "max_depth_m",
@@ -192,6 +210,7 @@ def write_history_csv(path, history):
         "wx",
         "wy",
         "wz",
+        "stop_reason",
     ]
 
     with open(path, "w", newline="") as f:
@@ -211,7 +230,6 @@ def write_history_csv(path, history):
                 "rotation_error_deg": item.get("rotation_error_deg", ""),
                 "cached_features": info.get("num_cached_features", ""),
                 "dropped_features": info.get("num_dropped_features", ""),
-                "reprojected_valid": info.get("num_reprojected_valid", ""),
                 "mean_depth_m": info.get("mean_depth_m", ""),
                 "min_depth_m": info.get("min_depth_m", ""),
                 "max_depth_m": info.get("max_depth_m", ""),
@@ -222,6 +240,7 @@ def write_history_csv(path, history):
                 "wx": float(velocity[3]),
                 "wy": float(velocity[4]),
                 "wz": float(velocity[5]),
+                "stop_reason": item.get("stop_reason", ""),
             })
 
 
@@ -245,33 +264,87 @@ def history_for_json(history):
             "translation_error_m": item.get("translation_error_m"),
             "rotation_error_deg": item.get("rotation_error_deg"),
             "visualization_path": item.get("visualization_path"),
+            "stop_reason": item.get("stop_reason"),
             "controller_info": item.get("controller_info", {}),
         })
     return rows
 
 
-def next_available_dir(path):
-    path = Path(path)
-    if not path.exists():
-        return path
-
-    index = 1
-    while True:
-        candidate = path.with_name(f"{path.name}_run-{index:03d}")
-        if not candidate.exists():
-            return candidate
-        index += 1
+def controller_short_name(controller):
+    """e.g. IBVSController -> 'ibvs'."""
+    name = controller.__class__.__name__
+    if name.lower().endswith("controller"):
+        name = name[: -len("Controller")]
+    return name.lower() or "controller"
 
 
-def make_output_dir(renderer, start_index, target_index, depth_mode):
-    base_dir = RUNS_ROOT / renderer.upper() / CONTROLLER_DIR
+def format_gain(gain):
+    text = f"{float(gain):.3g}"
+    return text.replace(".", "p")
+
+
+def make_run_tag(gain, feature_method, ratio):
+    return f"g{format_gain(gain)}_{feature_method}_r{int(ratio)}"
+
+
+def make_trial_name(start_index, target_index, depth_mode):
     if RUN_NAME is not None:
-        return next_available_dir(base_dir / RUN_NAME)
-    name = (
-        f"idx-{int(start_index):06d}_to_idx-{int(target_index):06d}_"
-        f"{depth_mode}_ratio-{RATIO}"
+        return str(RUN_NAME)
+    return f"{int(start_index)}-to-{int(target_index)}_{depth_mode}"
+
+
+def make_run_dir(controller, scene_name, renderer, start_index, target_index, depth_mode):
+    """Build hierarchical run directory:
+    RUNS/<controller>/<renderer>/<scene>/<trial>/<timestamp>_<tag>[_NN]
+    """
+    trial_dir = (
+        RUNS_ROOT
+        / controller_short_name(controller)
+        / renderer
+        / scene_name
+        / make_trial_name(start_index, target_index, depth_mode)
     )
-    return next_available_dir(base_dir / name)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    tag = make_run_tag(GAIN, FEATURE_METHOD, RATIO)
+    base = f"{timestamp}_{tag}"
+    candidate = trial_dir / base
+    suffix = 2
+    while candidate.exists():
+        candidate = trial_dir / f"{base}_{suffix:02d}"
+        suffix += 1
+    return trial_dir, candidate
+
+
+TRIAL_INDEX_FIELDS = [
+    "run_dir",
+    "timestamp",
+    "controller",
+    "renderer",
+    "scene",
+    "depth_mode",
+    "feature_method",
+    "gain",
+    "ratio",
+    "start_index",
+    "target_index",
+    "iterations_run",
+    "stop_reason",
+    "initial_translation_error_m",
+    "final_translation_error_m",
+    "initial_rotation_error_deg",
+    "final_rotation_error_deg",
+]
+
+
+def append_trial_index(trial_dir, row):
+    path = Path(trial_dir) / "_index.csv"
+    write_header = not path.exists()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=TRIAL_INDEX_FIELDS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow({k: row.get(k, "") for k in TRIAL_INDEX_FIELDS})
 
 
 def camera_metadata(camera):
@@ -285,14 +358,22 @@ def camera_metadata(camera):
     }
 
 
-def experiment_config(start_index, target_index, start_frame, target_frame, output_dir):
+def experiment_config(
+    controller_name,
+    trial_dir,
+    start_index,
+    target_index,
+    start_frame,
+    target_frame,
+    output_dir,
+):
     return {
         "script": str(Path(__file__).resolve()),
         "project_root": str(PROJECT_ROOT),
         "runs_root": str(RUNS_ROOT),
+        "trial_dir": str(trial_dir),
         "output_dir": str(output_dir),
-        "controller": "GeometricFeatureController",
-        "controller_dir": CONTROLLER_DIR,
+        "controller": controller_name,
         "renderer": RENDERER,
         "scene_dir": str(SCENE_DIR),
         "frame_selection": "logical_index",
@@ -307,15 +388,13 @@ def experiment_config(start_index, target_index, start_frame, target_frame, outp
         "dt": float(DT),
         "depth_mode": DEPTH_MODE,
         "feature_method": FEATURE_METHOD,
-        "ratio": int(RATIO),
         "viz_iter": int(VIZ_ITER),
         "gain": float(GAIN),
-        "damping": float(DAMPING),
-        "max_features": None if MAX_FEATURES is None else int(MAX_FEATURES),
         "min_features": int(MIN_FEATURES),
-        "max_translation_velocity": MAX_TRANSLATION_VELOCITY,
-        "max_rotation_velocity": MAX_ROTATION_VELOCITY,
+        "ratio": int(RATIO),
         "run_name": RUN_NAME,
+        "early_stop_error_threshold": float(EARLY_STOP_ERROR_THRESHOLD),
+        "early_stop_velocity_grad_eps": float(EARLY_STOP_VELOCITY_GRAD_EPS),
     }
 
 
@@ -334,26 +413,30 @@ def main():
     start_camera = start["camera"]
     target_camera = target["camera"]
 
-    output_dir = make_output_dir(RENDERER, start_index, target_index, DEPTH_MODE)
+    matcher = FeatureMatcher(method=FEATURE_METHOD)
+    controller = IBVSController(
+        matcher=matcher,
+        gain=GAIN,
+        min_features=MIN_FEATURES,
+        scene=scene,
+        use_intrinsic_depth=DEPTH_MODE == "intrinsic",
+        ratio=RATIO,
+    )
+    controller_name = controller.__class__.__name__
+
+    trial_dir, output_dir = make_run_dir(
+        controller,
+        SCENE_DIR.name,
+        RENDERER,
+        start_index,
+        target_index,
+        DEPTH_MODE,
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     logs_dir = output_dir / "logs"
     visualizations_dir = output_dir / "visualizations"
     logs_dir.mkdir(parents=True, exist_ok=True)
     visualizations_dir.mkdir(parents=True, exist_ok=True)
-
-    matcher = FeatureMatcher(method=FEATURE_METHOD)
-    controller = GeometricFeatureController(
-        matcher=matcher,
-        gain=GAIN,
-        damping=DAMPING,
-        max_features=MAX_FEATURES,
-        min_features=MIN_FEATURES,
-        max_translation_velocity=MAX_TRANSLATION_VELOCITY,
-        max_rotation_velocity=MAX_ROTATION_VELOCITY,
-        scene=scene,
-        use_intrinsic_depth=DEPTH_MODE == "intrinsic",
-        ratio=RATIO,
-    )
 
     target_image = load_rgb(target["rgb_path"], start_camera.W, start_camera.H)
     initial_render = scene.render(start_camera)
@@ -390,6 +473,11 @@ def main():
             f"inliers={inliers}"
         )
 
+    early_stopper = SimpleStopper(
+        error_threshold=EARLY_STOP_ERROR_THRESHOLD,
+        velocity_grad_eps=EARLY_STOP_VELOCITY_GRAD_EPS,
+    )
+
     result = run_servo_loop(
         scene,
         start_camera,
@@ -401,6 +489,7 @@ def main():
         matcher=matcher,
         feature_method=FEATURE_METHOD,
         iteration_callback=record_iteration_metrics,
+        early_stopper=early_stopper,
         viz_iter=VIZ_ITER,
     )
 
@@ -422,14 +511,17 @@ def main():
     final_rotation_error = rotation_error_deg(final_camera, target_camera)
     summary = {
         "config": experiment_config(
+            controller_name,
+            trial_dir,
             start_index,
             target_index,
             start_frame,
             target_frame,
             output_dir,
         ),
+        "controller": controller_name,
         "renderer": RENDERER,
-        "controller_dir": CONTROLLER_DIR,
+        "trial_dir": str(trial_dir),
         "scene_dir": str(SCENE_DIR),
         "frame_selection": "logical_index",
         "frame_index_base": 1,
@@ -442,7 +534,6 @@ def main():
         "target_rgb": str(target["rgb_path"]),
         "depth": DEPTH_MODE,
         "feature_method": FEATURE_METHOD,
-        "ratio": int(RATIO),
         "viz_iter": int(VIZ_ITER),
         "logs_dir": str(logs_dir),
         "visualizations_dir": str(visualizations_dir),
@@ -457,6 +548,9 @@ def main():
         "final_translation_error_m": final_translation_error,
         "initial_rotation_error_deg": initial_rotation_error,
         "final_rotation_error_deg": final_rotation_error,
+        "iterations_run": len(result["history"]),
+        "stop_reason": result["stop_reason"],
+        "stop_iteration": result["stop_iteration"],
         "history": history_for_json(result["history"]),
     }
 
@@ -469,12 +563,34 @@ def main():
     with open(logs_dir / "config.json", "w") as f:
         json.dump(summary["config"], f, indent=2)
 
+    append_trial_index(trial_dir, {
+        "run_dir": output_dir.name,
+        "timestamp": output_dir.name.split("_", 1)[0],
+        "controller": controller_name,
+        "renderer": RENDERER,
+        "scene": SCENE_DIR.name,
+        "depth_mode": DEPTH_MODE,
+        "feature_method": FEATURE_METHOD,
+        "gain": float(GAIN),
+        "ratio": int(RATIO),
+        "start_index": int(start_index),
+        "target_index": int(target_index),
+        "iterations_run": len(result["history"]),
+        "stop_reason": result["stop_reason"],
+        "initial_translation_error_m": initial_translation_error,
+        "final_translation_error_m": final_translation_error,
+        "initial_rotation_error_deg": initial_rotation_error,
+        "final_rotation_error_deg": final_rotation_error,
+    })
+
     last = result["history"][-1] if result["history"] else {}
     info = last.get("controller_info", {})
     print(
-        f"Servo {RENDERER}: index {start_index} -> {target_index} "
+        f"Servo {controller_name} {RENDERER}: index {start_index} -> {target_index} "
         f"({start_frame} -> {target_frame}), "
-        f"depth={DEPTH_MODE}, ratio={RATIO}, iterations={ITERATIONS}"
+        f"depth={DEPTH_MODE}, "
+        f"iterations={len(result['history'])}/{ITERATIONS}, "
+        f"stop={result['stop_reason']}"
     )
     print(
         f"Translation error: {initial_translation_error:.4f}m -> "

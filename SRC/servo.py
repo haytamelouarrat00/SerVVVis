@@ -84,29 +84,51 @@ class FixedVelocityController:
         return self.velocity.copy()
 
 
-def split_removed_matches(kpts1, kpts2, kpts1_kept, kpts2_kept):
-    kept_mask = np.zeros(len(kpts1), dtype=bool)
-    kept_idx = 0
+class SimpleStopper:
+    """Stop when ||error|| < error_threshold OR ||v[i] - v[i-1]|| < velocity_grad_eps."""
 
-    for i in range(len(kpts1)):
-        if kept_idx >= len(kpts1_kept):
-            break
-        if (
-            np.allclose(kpts1[i], kpts1_kept[kept_idx])
-            and np.allclose(kpts2[i], kpts2_kept[kept_idx])
-        ):
-            kept_mask[i] = True
-            kept_idx += 1
+    def __init__(self, error_threshold, velocity_grad_eps):
+        self.error_threshold = float(error_threshold)
+        self.velocity_grad_eps = float(velocity_grad_eps)
+        self.prev_velocity = None
+        self.stop_reason = None
+        self.stop_iteration = None
 
-    if kept_idx != len(kpts1_kept):
-        raise RuntimeError("Filtered keypoints are not an ordered subset of matches")
+    def __call__(self, item):
+        if self.stop_reason is not None:
+            return True
 
-    return kpts1[~kept_mask], kpts2[~kept_mask]
+        info = item.get("controller_info", {})
+        residual = info.get("residual_norm")
+        iteration = int(item["iteration"])
+
+        if residual is not None and np.isfinite(float(residual)):
+            if float(residual) < self.error_threshold:
+                self.stop_reason = "error_below_threshold"
+                self.stop_iteration = iteration
+                return True
+
+        velocity = np.asarray(item.get("velocity", []), dtype=np.float32).reshape(-1)
+        if velocity.shape == (6,):
+            if self.prev_velocity is not None:
+                grad_norm = float(np.linalg.norm(velocity - self.prev_velocity))
+                if grad_norm < self.velocity_grad_eps:
+                    self.stop_reason = "velocity_gradient_below_eps"
+                    self.stop_iteration = iteration
+                    return True
+            self.prev_velocity = velocity.copy()
+        return False
+
+    def metadata(self):
+        return {
+            "stop_reason": self.stop_reason,
+            "stop_iteration": self.stop_iteration,
+        }
 
 
 def save_iteration_matches(rendered, target, camera, matcher, output_path):
     kpts1, kpts2 = matcher.match(rendered, target)
-    kpts1_kept, kpts2_kept, _, _, _ = filter_matches(kpts1, kpts2, camera)
+    kpts1_kept, kpts2_kept, _, _, _, _ = filter_matches(kpts1, kpts2, camera)
     matches_kept = [(i, i) for i in range(len(kpts1_kept))]
     empty = np.zeros((0, 2), dtype=np.float32)
 
@@ -179,6 +201,7 @@ def run_servo_loop(
     matcher=None,
     feature_method="xfeat",
     iteration_callback=None,
+    early_stopper=None,
     viz_iter=1,
 ):
     if iterations < 0:
@@ -194,6 +217,8 @@ def run_servo_loop(
 
     camera = copy_camera_with_pose(initial_camera, initial_camera.T_world_cam.copy())
     history = []
+    stop_reason = None
+    stop_iteration = None
 
     for iteration in range(iterations):
         rendered = scene.render(camera)
@@ -241,14 +266,37 @@ def run_servo_loop(
             "controller_info": dict(controller_info),
             **match_info,
         }
+        callback_stop = False
         if iteration_callback is not None:
-            iteration_callback(history_item)
+            callback_stop = bool(iteration_callback(history_item))
+
+        stopper_stop = False
+        if early_stopper is not None:
+            stopper_stop = bool(early_stopper(history_item))
+
+        if stopper_stop:
+            stop_reason = early_stopper.stop_reason or "early_stop"
+            stop_iteration = early_stopper.stop_iteration
+            history_item["stop_reason"] = stop_reason
+        elif callback_stop:
+            stop_reason = "callback"
+            stop_iteration = int(iteration)
+            history_item["stop_reason"] = stop_reason
+
         history.append(history_item)
 
+        if stop_reason is not None:
+            break
+
         camera = next_camera
+
+    if stop_reason is None:
+        stop_reason = "max_iterations"
 
     return {
         "camera": camera,
         "rendered": scene.render(camera),
         "history": history,
+        "stop_reason": stop_reason,
+        "stop_iteration": stop_iteration,
     }

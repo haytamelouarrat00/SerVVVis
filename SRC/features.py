@@ -42,10 +42,19 @@ class FeatureMatcher:
 
         bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=True)
         matches = bf.match(des1, des2)
-        matches = sorted(matches, key=lambda m: m.distance)
+        if not matches:
+            empty = np.zeros((0, 2), dtype=np.float32)
+            return empty, empty.copy()
 
-        kpts1 = np.array([kp1[m.queryIdx].pt for m in matches], dtype=np.float32)
-        kpts2 = np.array([kp2[m.trainIdx].pt for m in matches], dtype=np.float32)
+        distances = np.fromiter((m.distance for m in matches), dtype=np.float32, count=len(matches))
+        order = np.argsort(distances, kind="stable")
+        query_idx = np.fromiter((m.queryIdx for m in matches), dtype=np.int64, count=len(matches))[order]
+        train_idx = np.fromiter((m.trainIdx for m in matches), dtype=np.int64, count=len(matches))[order]
+
+        pts1_all = cv2.KeyPoint_convert(kp1)
+        pts2_all = cv2.KeyPoint_convert(kp2)
+        kpts1 = pts1_all[query_idx].astype(np.float32, copy=False)
+        kpts2 = pts2_all[train_idx].astype(np.float32, copy=False)
         return kpts1, kpts2
 
     def _match_xfeat(self, im1_u8, im2_u8):
@@ -72,7 +81,10 @@ class FeatureMatcher:
 def filter_matches(kpts1, kpts2, camera=None):
     """RANSAC homography filter on already-paired keypoint arrays.
 
-    Always returns a 5-tuple: (kpts1_f, kpts2_f, H_matrix, kpts1_n, kpts2_n).
+    Returns a 6-tuple:
+        (kpts1_f, kpts2_f, H_matrix, kpts1_n, kpts2_n, inliers_mask).
+    inliers_mask is a (N,) bool array over the original kpts1/kpts2 marking
+    which input pairs survived RANSAC; all-False on failure.
     If no camera is provided, the normalized coords are None.
     If fewer than 4 inliers survive RANSAC (or RANSAC fails), H_matrix is None
     and the filtered arrays are empty.
@@ -83,11 +95,12 @@ def filter_matches(kpts1, kpts2, camera=None):
         f"kpts1/kpts2 must be paired (N, 2) arrays, got {kpts1.shape} vs {kpts2.shape}"
 
     empty = np.zeros((0, 2), dtype=np.float32)
+    fail_mask = np.zeros(kpts1.shape[0], dtype=bool)
 
     def _fail():
         if camera is None:
-            return empty, empty.copy(), None, None, None
-        return empty, empty.copy(), None, empty.copy(), empty.copy()
+            return empty, empty.copy(), None, None, None, fail_mask
+        return empty, empty.copy(), None, empty.copy(), empty.copy(), fail_mask
 
     if kpts1.shape[0] < 4:
         return _fail()
@@ -109,7 +122,7 @@ def filter_matches(kpts1, kpts2, camera=None):
         return _fail()
 
     if camera is None:
-        return kpts1_f, kpts2_f, H_matrix, None, None
+        return kpts1_f, kpts2_f, H_matrix, None, None, inliers
 
     fx, fy, cx, cy = camera.fx, camera.fy, camera.cx, camera.cy
     kpts1_n = np.empty_like(kpts1_f)
@@ -119,4 +132,4 @@ def filter_matches(kpts1, kpts2, camera=None):
     kpts2_n[:, 0] = (kpts2_f[:, 0] - cx) / fx
     kpts2_n[:, 1] = (kpts2_f[:, 1] - cy) / fy
 
-    return kpts1_f, kpts2_f, H_matrix, kpts1_n, kpts2_n
+    return kpts1_f, kpts2_f, H_matrix, kpts1_n, kpts2_n, inliers

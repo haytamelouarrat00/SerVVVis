@@ -10,6 +10,16 @@ def save_side_by_side(img1, img2, path):
     Image.fromarray(out_uint8).save(path)
 
 
+def _to_int_pixels(kpts, x_offset=0):
+    if len(kpts) == 0:
+        return np.zeros((0, 2), dtype=np.int32)
+    pts = np.rint(np.asarray(kpts, dtype=np.float32)).astype(np.int32)
+    if x_offset:
+        pts = pts.copy()
+        pts[:, 0] += x_offset
+    return pts
+
+
 def save_match_visualization(
     img1,
     img2,
@@ -32,30 +42,23 @@ def save_match_visualization(
     GREEN_ALPHA = 0.5
     RED_ALPHA = 0.25
 
-    def endpoints(src_kpts1, src_kpts2, i, j):
-        p1 = (int(round(float(src_kpts1[i, 0]))), int(round(float(src_kpts1[i, 1]))))
-        p2 = (
-            int(round(float(src_kpts2[j, 0]))) + W1,
-            int(round(float(src_kpts2[j, 1]))),
-        )
-        return p1, p2
-
-    if draw_removed:
+    if draw_removed and matches_removed:
+        p1_r = _to_int_pixels(kpts1_removed)
+        p2_r = _to_int_pixels(kpts2_removed, x_offset=W1)
         red_overlay = canvas.copy()
         for i, j in matches_removed:
-            p1, p2 = endpoints(kpts1_removed, kpts2_removed, i, j)
-            cv2.line(red_overlay, p1, p2, RED, 1, lineType=cv2.LINE_AA)
+            cv2.line(red_overlay, tuple(p1_r[i]), tuple(p2_r[j]), RED, 1, lineType=cv2.LINE_AA)
         cv2.addWeighted(red_overlay, RED_ALPHA, canvas, 1.0 - RED_ALPHA, 0, canvas)
 
+    p1_k = _to_int_pixels(kpts1_kept)
+    p2_k = _to_int_pixels(kpts2_kept, x_offset=W1)
     green_overlay = canvas.copy()
     for i, j in matches_kept:
-        p1, p2 = endpoints(kpts1_kept, kpts2_kept, i, j)
-        cv2.line(green_overlay, p1, p2, GREEN, 1, lineType=cv2.LINE_AA)
-
-    for i, j in matches_kept:
-        p1, p2 = endpoints(kpts1_kept, kpts2_kept, i, j)
-        cv2.circle(green_overlay, p1, 3, GREEN, 1, lineType=cv2.LINE_AA)
-        cv2.circle(green_overlay, p2, 3, GREEN, 1, lineType=cv2.LINE_AA)
+        a = tuple(p1_k[i])
+        b = tuple(p2_k[j])
+        cv2.line(green_overlay, a, b, GREEN, 1, lineType=cv2.LINE_AA)
+        cv2.circle(green_overlay, a, 3, GREEN, 1, lineType=cv2.LINE_AA)
+        cv2.circle(green_overlay, b, 3, GREEN, 1, lineType=cv2.LINE_AA)
     cv2.addWeighted(green_overlay, GREEN_ALPHA, canvas, 1.0 - GREEN_ALPHA, 0, canvas)
 
     Image.fromarray(canvas).save(path)
