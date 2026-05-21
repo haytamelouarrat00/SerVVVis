@@ -9,7 +9,7 @@ Usage:
         [--rpe-delta 1]
 
 Each positional argument must be a directory containing `sim_traj.tum` and
-`gt_traj.tum` (the layout produced by main_trajectory.py).
+`gt_traj.tum` (the layout produced by `cli.py trajectory`).
 
 Outputs in --out (default: ./compare_<timestamp> under cwd):
     trajectory_xyz.png      sim vs GT, 3D
@@ -30,7 +30,7 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-from main_trajectory import (
+from runners.trajectory import (
     poses_to_evo_trajectory,
     read_tum,
     stat_dict,

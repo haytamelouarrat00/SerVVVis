@@ -156,7 +156,7 @@ def render_missing_scene_visuals(
     pattern="task_{task_index:04d}_final_vs_target.png",
     max_frames=None,
 ):
-    from main_servo_frames import (
+    from runners.servo_frames import (
         PROJECT_ROOT as MAIN_PROJECT_ROOT,
         load_rgb as load_target_rgb,
         load_scene_and_frames,

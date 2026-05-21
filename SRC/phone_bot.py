@@ -282,14 +282,13 @@ def parse_experiment_args(kind, args_text):
 
 def build_command(kind, args_text, python_executable):
     config_path, set_args, overrides = parse_experiment_args(kind, args_text)
-    if kind == "trajectory":
-        script = PROJECT_ROOT / "SRC" / "main_trajectory.py"
-    else:
-        script = PROJECT_ROOT / "SRC" / "main_servo_frames.py"
+    cli_script = PROJECT_ROOT / "SRC" / "cli.py"
+    subcommand = "trajectory" if kind == "trajectory" else "servo-frames"
 
     command = [
         python_executable,
-        str(script),
+        str(cli_script),
+        subcommand,
         "--config",
         str(config_path),
     ]

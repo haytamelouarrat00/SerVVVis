@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 from camera import Camera
@@ -152,6 +153,71 @@ def save_iteration_matches(rendered, target, camera, matcher, output_path):
     }
 
 
+def save_photometric_visualization(rendered, target, visualization, output_path):
+    """Three-panel viz for photometric servoing: rendered | target | |diff| heatmap.
+
+    Diff is computed on grayscale intensities in [0, 1]; mapped to JET colormap
+    over [0, max(|diff|)] of the current frame, and a fixed-range overlay over
+    [0, 0.5] is also drawn alongside so the absolute scale is visible.
+    """
+    def to_uint8_rgb(image):
+        arr = np.asarray(image, dtype=np.float32)
+        if arr.ndim == 2:
+            arr = np.stack([arr] * 3, axis=-1)
+        arr = np.clip(arr, 0.0, 1.0)
+        return (arr * 255.0 + 0.5).astype(np.uint8)
+
+    def to_gray01(image):
+        arr = np.asarray(image, dtype=np.float32)
+        if arr.ndim == 2:
+            return np.clip(arr, 0.0, 1.0)
+        return cv2.cvtColor(np.clip(arr, 0.0, 1.0), cv2.COLOR_RGB2GRAY)
+
+    gray_cur = to_gray01(rendered)
+    gray_tgt = to_gray01(target)
+    diff = np.abs(gray_cur - gray_tgt)
+    diff_max = float(diff.max()) if diff.size else 0.0
+
+    diff_norm = (diff / max(diff_max, 1e-6) * 255.0).astype(np.uint8)
+    heat_auto = cv2.applyColorMap(diff_norm, cv2.COLORMAP_JET)
+    heat_auto = cv2.cvtColor(heat_auto, cv2.COLOR_BGR2RGB)
+
+    rendered_rgb = to_uint8_rgb(rendered)
+    target_rgb = to_uint8_rgb(target)
+
+    H = rendered_rgb.shape[0]
+    label_strip = 22
+    panels = []
+    for img, label in (
+        (rendered_rgb, "rendered"),
+        (target_rgb, "target"),
+        (heat_auto, f"|I-I*|  max={diff_max:.3f}"),
+    ):
+        panel = np.zeros((H + label_strip, img.shape[1], 3), dtype=np.uint8)
+        cv2.putText(
+            panel, label, (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+            (255, 255, 255), 1, cv2.LINE_AA,
+        )
+        panel[label_strip:, :, :] = img
+        panels.append(panel)
+
+    out = np.concatenate(panels, axis=1)
+    out_bgr = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(output_path), out_bgr)
+
+    info = visualization or {}
+    return {
+        "num_matches": int(info.get("num_pixels_used", 0)),
+        "num_inliers": int(info.get("num_pixels_used", 0)),
+        "feature_mode": info.get("feature_mode", "photometric"),
+        "visualization_path": str(output_path),
+        "diff_max": diff_max,
+        "diff_mean": float(diff.mean()) if diff.size else 0.0,
+    }
+
+
 def save_controller_matches(rendered, target, visualization, output_path):
     kpts_current = np.asarray(
         visualization.get("kpts_current", np.zeros((0, 2), dtype=np.float32)),
@@ -237,26 +303,40 @@ def run_servo_loop(
             and iteration % int(viz_iter) == 0
         )
         if should_save_viz:
-            output_path = visualization_dir / f"iter_{iteration:04d}_matches.png"
             controller_visualization = getattr(controller, "last_visualization", None)
-            if (
+            is_photometric = (
                 controller_visualization is not None
                 and controller_visualization.get("iteration") == iteration
-            ):
-                match_info = save_controller_matches(
+                and controller_visualization.get("feature_mode") == "photometric"
+            )
+            if is_photometric:
+                output_path = visualization_dir / f"iter_{iteration:04d}_photometric.png"
+                match_info = save_photometric_visualization(
                     rendered,
                     target_image,
                     controller_visualization,
                     output_path,
                 )
             else:
-                match_info = save_iteration_matches(
-                    rendered,
-                    target_image,
-                    camera,
-                    matcher,
-                    output_path,
-                )
+                output_path = visualization_dir / f"iter_{iteration:04d}_matches.png"
+                if (
+                    controller_visualization is not None
+                    and controller_visualization.get("iteration") == iteration
+                ):
+                    match_info = save_controller_matches(
+                        rendered,
+                        target_image,
+                        controller_visualization,
+                        output_path,
+                    )
+                else:
+                    match_info = save_iteration_matches(
+                        rendered,
+                        target_image,
+                        camera,
+                        matcher,
+                        output_path,
+                    )
 
         history_item = {
             "iteration": iteration,

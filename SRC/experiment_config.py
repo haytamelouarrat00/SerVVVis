@@ -8,19 +8,27 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_ROOT = PROJECT_ROOT / "CONFIGS"
 
 
+_PHOTOMETRIC_KEYS = {
+    "controller": "CONTROLLER",
+    "sigma_blur": "SIGMA_BLUR",
+    "use_gzn": "USE_GZN",
+    "grad_percentile": "GRAD_PERCENTILE",
+    "photometric_max_pixels": "PHOTOMETRIC_MAX_PIXELS",
+    "use_huber": "USE_HUBER",
+    "huber_k": "HUBER_K",
+}
+
 TRAJECTORY_CONFIG_KEYS = {
     "datasets": "DATASETS",
     "renderer": "RENDERER",
-    "nerf_pose_source": "NERF_POSE_SOURCE",
     "nerf_render_scale": "NERF_RENDER_SCALE",
-    "mesh_path": "MESH_PATH",
-    "mesh_pose_source": "MESH_POSE_SOURCE",
     "stride": "STRIDE",
     "mini_iterations": "MINI_ITERATIONS",
     "dt": "DT",
     "depth_mode": "DEPTH_MODE",
     "feature_method": "FEATURE_METHOD",
-    "gain": "GAIN",
+    "gain_ibvs": "GAIN_IBVS",
+    "gain_photo": "GAIN_PHOTO",
     "min_features": "MIN_FEATURES",
     "ratio": "RATIO",
     "start_index": "START_INDEX",
@@ -31,12 +39,12 @@ TRAJECTORY_CONFIG_KEYS = {
     "run_tag": "RUN_TAG",
     "save_task_viz": "SAVE_TASK_VIZ",
     "task_viz_every": "TASK_VIZ_EVERY",
+    **_PHOTOMETRIC_KEYS,
 }
 
 SERVO_FRAMES_CONFIG_KEYS = {
     "scene_dir": "SCENE_DIR",
     "renderer": "RENDERER",
-    "nerf_pose_source": "NERF_POSE_SOURCE",
     "start_index": "START_INDEX",
     "index_away": "INDEX_AWAY",
     "target_index": "TARGET_INDEX",
@@ -45,12 +53,14 @@ SERVO_FRAMES_CONFIG_KEYS = {
     "depth_mode": "DEPTH_MODE",
     "feature_method": "FEATURE_METHOD",
     "viz_iter": "VIZ_ITER",
-    "gain": "GAIN",
+    "gain_ibvs": "GAIN_IBVS",
+    "gain_photo": "GAIN_PHOTO",
     "min_features": "MIN_FEATURES",
     "ratio": "RATIO",
     "run_name": "RUN_NAME",
     "early_stop_error_threshold": "EARLY_STOP_ERROR_THRESHOLD",
     "early_stop_velocity_grad_eps": "EARLY_STOP_VELOCITY_GRAD_EPS",
+    **_PHOTOMETRIC_KEYS,
 }
 
 COMMON_ALIASES = {
@@ -60,6 +70,7 @@ COMMON_ALIASES = {
     "viz_every": "viz_iter",
     "visualize_every": "viz_iter",
     "min_matches": "min_features",
+    "gain": "gain_ibvs",
 }
 
 KIND_ALIASES = {
@@ -77,9 +88,6 @@ KIND_ALIASES = {
         "tag": "run_tag",
         "nerf_scale": "nerf_render_scale",
         "render_scale": "nerf_render_scale",
-        "mesh_file": "mesh_path",
-        "mesh_ply": "mesh_path",
-        "mesh_source": "mesh_pose_source",
     },
     "servo_frames": {
         "dataset": "scene_dir",
@@ -94,8 +102,7 @@ KIND_ALIASES = {
 
 RENDERERS = {"mesh", "gs", "nerf"}
 DEPTH_MODES = {"learned", "intrinsic"}
-NERF_POSE_SOURCES = {"colmap", "scannet"}
-MESH_POSE_SOURCES = {"colmap", "scannet"}
+CONTROLLERS = {"ibvs", "photometric", "photometric_torch"}
 
 INT_KEYS = {
     "stride",
@@ -108,17 +115,22 @@ INT_KEYS = {
     "viz_iter",
     "rpe_delta",
     "task_viz_every",
+    "photometric_max_pixels",
 }
 OPTIONAL_INT_KEYS = {"max_pairs", "target_index"}
 FLOAT_KEYS = {
     "dt",
-    "gain",
+    "gain_ibvs",
+    "gain_photo",
     "nerf_render_scale",
     "early_stop_error_threshold",
     "early_stop_velocity_grad_eps",
+    "sigma_blur",
+    "grad_percentile",
 }
-BOOL_KEYS = {"save_task_viz"}
-OPTIONAL_STR_KEYS = {"run_tag", "run_name", "mesh_path"}
+OPTIONAL_FLOAT_KEYS = {"huber_k"}
+BOOL_KEYS = {"save_task_viz", "use_gzn", "use_huber"}
+OPTIONAL_STR_KEYS = {"run_tag", "run_name"}
 
 
 def resolve_config_path(path):
@@ -231,9 +243,22 @@ def coerce_config_value(key, value):
             raise ValueError("dt must be > 0")
         if key == "nerf_render_scale" and value <= 0.0:
             raise ValueError("nerf_render_scale must be > 0")
+        if key == "sigma_blur" and value < 0.0:
+            raise ValueError("sigma_blur must be >= 0")
+        if key == "grad_percentile" and not (0.0 <= value < 100.0):
+            raise ValueError("grad_percentile must be in [0, 100)")
         return value
+    if key in OPTIONAL_FLOAT_KEYS:
+        if is_null_value(value):
+            return None
+        return float(value)
     if key in BOOL_KEYS:
         return coerce_bool(value)
+    if key == "controller":
+        value = str(value).lower()
+        if value not in CONTROLLERS:
+            raise ValueError(f"controller must be one of {sorted(CONTROLLERS)}")
+        return value
     if key in OPTIONAL_STR_KEYS:
         if is_null_value(value):
             return None
@@ -247,20 +272,6 @@ def coerce_config_value(key, value):
         value = str(value).lower()
         if value not in DEPTH_MODES:
             raise ValueError(f"depth_mode must be one of {sorted(DEPTH_MODES)}")
-        return value
-    if key == "nerf_pose_source":
-        value = str(value).lower()
-        if value not in NERF_POSE_SOURCES:
-            raise ValueError(
-                f"nerf_pose_source must be one of {sorted(NERF_POSE_SOURCES)}"
-            )
-        return value
-    if key == "mesh_pose_source":
-        value = str(value).lower()
-        if value not in MESH_POSE_SOURCES:
-            raise ValueError(
-                f"mesh_pose_source must be one of {sorted(MESH_POSE_SOURCES)}"
-            )
         return value
     if key == "feature_method":
         return str(value).lower()
@@ -317,6 +328,7 @@ def validate_int_value(key, value):
         "ratio",
         "viz_iter",
         "task_viz_every",
+        "photometric_max_pixels",
     } and value < 0:
         raise ValueError(f"{key} must be >= 0")
 

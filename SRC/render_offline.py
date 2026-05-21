@@ -1,6 +1,6 @@
 """Offline re-rendering of a previous trajectory run.
 
-Given a `<run>/<scene>/` directory produced by `main_trajectory.py`, rebuild
+Given a `<run>/<scene>/` directory produced by `cli.py trajectory`, rebuild
 the scene + camera intrinsics from `summary.json`, parse `sim_traj.tum`
 (and optionally `gt_traj.tum`), and render each pose to disk.
 
@@ -29,7 +29,7 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 from camera import Camera
-from main_servo_frames import load_rgb, load_scene_and_frames, save_rgb
+from runners.servo_frames import load_rgb, load_scene_and_frames, save_rgb
 from viz import save_side_by_side
 
 
@@ -113,7 +113,6 @@ def main():
         summary = json.load(f)
 
     renderer = summary["renderer"]
-    nerf_pose_source = summary.get("nerf_pose_source", "colmap")
     intrinsics = summary["camera"]
     scene_dir = args.scene_dir or Path(summary.get("scene_dir", ""))
     if not scene_dir.exists():
@@ -126,9 +125,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading {renderer} scene from {scene_dir} ...")
-    scene, _frame_index = load_scene_and_frames(
-        scene_dir, renderer, nerf_pose_source=nerf_pose_source,
-    )
+    scene, _frame_index = load_scene_and_frames(scene_dir, renderer)
 
     print(f"Reading sim trajectory: {sim_tum_path}")
     sim_ts, sim_poses = read_tum(sim_tum_path)

@@ -7,6 +7,7 @@ Implements the basic IBVS scheme:
     v_c = -lambda * pinv(L_e) * e                    (paper eq. 5)
 """
 
+import cv2
 import numpy as np
 
 from depth import get_depth
@@ -108,6 +109,143 @@ def point_interaction_matrix(points, depths):
     L[1::2, 5] = -x
 
     return L
+
+
+# ----------------------------------------------------------------------------
+# Photometric helpers (Collewet & Marchand RR-6631; Rodriguez et al. Sensors 2020)
+# ----------------------------------------------------------------------------
+
+
+def image_to_gray(rgb_float01):
+    """RGB float in [0, 1] -> grayscale float32 (H, W)."""
+    rgb = np.asarray(rgb_float01, dtype=np.float32)
+    if rgb.ndim == 2:
+        return rgb.astype(np.float32, copy=False)
+    if rgb.ndim != 3 or rgb.shape[2] not in (3, 4):
+        raise ValueError(f"image_to_gray expected (H, W, 3|4), got {rgb.shape}")
+    if rgb.shape[2] == 4:
+        rgb = rgb[..., :3]
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+
+
+def gaussian_blur(image, sigma):
+    """Isotropic Gaussian blur. Passthrough for sigma <= 0."""
+    image = np.asarray(image, dtype=np.float32)
+    if float(sigma) <= 0.0:
+        return image
+    return cv2.GaussianBlur(image, ksize=(0, 0), sigmaX=float(sigma))
+
+
+def gzn_transform(gray, sigma):
+    """Gaussian + Zero-mean Normalization (Rodriguez Sensors 2020, eq. 1+2)."""
+    gray = np.asarray(gray, dtype=np.float32)
+    blurred = gaussian_blur(gray, sigma)
+    mean = float(blurred.mean())
+    std = float(blurred.std())
+    return (blurred - mean) / (std + 1e-8)
+
+
+def image_gradient(gray):
+    """Sobel ksize=3 spatial gradient, scaled to true derivative magnitude."""
+    gray = np.asarray(gray, dtype=np.float32)
+    # Sobel ksize=3 kernel sum on one side = 4; for symmetric derivative -> /8
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3) * (1.0 / 8.0)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3) * (1.0 / 8.0)
+    return gx, gy
+
+
+def pixel_grid_normalized(camera):
+    """(H, W) meshgrids of normalized image coords x=(u-cx)/fx, y=(v-cy)/fy."""
+    u = np.arange(camera.W, dtype=np.float32)
+    v = np.arange(camera.H, dtype=np.float32)
+    uu, vv = np.meshgrid(u, v)
+    xn = (uu - camera.cx) / camera.fx
+    yn = (vv - camera.cy) / camera.fy
+    return xn.astype(np.float32, copy=False), yn.astype(np.float32, copy=False)
+
+
+def photometric_interaction(gx, gy, xn, yn, z):
+    """Per-pixel luminance interaction matrix (RR-6631 eq. 9).
+
+        L_I_i = -[gx_i, gy_i] @ L_x(xn_i, yn_i, z_i)
+
+    Inputs are 1-D arrays of length N (already masked & flattened).
+    Returns (N, 6) float32.
+    """
+    gx = np.asarray(gx, dtype=np.float32).reshape(-1)
+    gy = np.asarray(gy, dtype=np.float32).reshape(-1)
+    xn = np.asarray(xn, dtype=np.float32).reshape(-1)
+    yn = np.asarray(yn, dtype=np.float32).reshape(-1)
+    z = np.asarray(z, dtype=np.float32).reshape(-1)
+    n = gx.size
+    if not (gy.size == n and xn.size == n and yn.size == n and z.size == n):
+        raise ValueError("photometric_interaction: input length mismatch")
+
+    points = np.stack([xn, yn], axis=1)
+    Lx_stacked = point_interaction_matrix(points, z)  # (2N, 6)
+    Lx = Lx_stacked.reshape(n, 2, 6)                  # (N, 2, 6)
+    # L_I = -[gx, gy] @ Lx  --> (N, 6)
+    grads = np.stack([gx, gy], axis=1)                # (N, 2)
+    L = -(grads[:, :, None] * Lx).sum(axis=1)
+    return L.astype(np.float32, copy=False)
+
+
+def build_pixel_mask(
+    I_star,
+    gx_star,
+    gy_star,
+    Z_star,
+    grad_percentile=50.0,
+    sat_lo=0.02,
+    sat_hi=0.98,
+    min_depth=1e-4,
+):
+    """Boolean mask of pixels usable for photometric servo on the desired image.
+
+    Drops: invalid/shallow depth, saturated intensity, low-gradient pixels.
+    `grad_percentile` keeps the top (100 - p)% by |grad| within the depth-and-
+    intensity-valid region.
+    """
+    I_star = np.asarray(I_star, dtype=np.float32)
+    gx_star = np.asarray(gx_star, dtype=np.float32)
+    gy_star = np.asarray(gy_star, dtype=np.float32)
+    Z_star = np.asarray(Z_star, dtype=np.float32)
+
+    valid = np.isfinite(Z_star) & (Z_star > float(min_depth))
+    valid &= np.isfinite(I_star)
+    # sat_lo / sat_hi semantics only make sense in [0, 1] raw intensity space;
+    # if the input is GZN-normalized (sat range meaningless) the caller can
+    # pass sat_lo=-inf, sat_hi=inf to disable.
+    if np.isfinite(sat_lo):
+        valid &= I_star >= float(sat_lo)
+    if np.isfinite(sat_hi):
+        valid &= I_star <= float(sat_hi)
+
+    grad_mag = np.sqrt(gx_star * gx_star + gy_star * gy_star)
+    if valid.any():
+        thresh = float(np.percentile(grad_mag[valid], float(grad_percentile)))
+    else:
+        thresh = 0.0
+    valid &= grad_mag >= thresh
+    return valid
+
+
+def huber_weights(residuals, k=None):
+    """Huber re-weighting w_i = 1 if |r| <= k else k / |r|.
+
+    If `k` is None, derive k = 1.345 * 1.4826 * MAD(residuals).
+    """
+    r = np.asarray(residuals, dtype=np.float32).reshape(-1)
+    abs_r = np.abs(r)
+    if k is None:
+        med = float(np.median(r))
+        mad = float(np.median(np.abs(r - med)))
+        k = 1.345 * 1.4826 * max(mad, 1e-6)
+    k = float(k)
+    w = np.ones_like(abs_r)
+    big = abs_r > k
+    w[big] = k / np.maximum(abs_r[big], 1e-12)
+    return w.astype(np.float32, copy=False), k
 
 
 class IBVSController:
@@ -296,3 +434,245 @@ class IBVSController:
             "kpts_target": kpts_target.copy(),
         }
         return velocity
+
+
+class PhotometricController:
+    """Direct photometric visual servo (Collewet & Marchand RR-6631).
+
+    Uses raw pixel intensities as the visual feature; no matching/tracking.
+    Error e = I - I*; control law v = -gain * (H + eps I)^-1 L^T e with the
+    analytic luminance interaction matrix L_I = -grad(I)^T L_x. Optionally
+    applies Gaussian Zero-mean Normalization (Rodriguez Sensors 2020) for
+    robustness to global illumination changes, and Huber re-weighting for
+    robustness to occluders/specularities. Depth is taken at the desired pose
+    once and cached (`depth_mode="desired_only"`); requires `target_camera`
+    via constructor or `set_target_camera()` before the first call.
+
+    Phase 1 scope: Gauss-Newton solve, single scale, desired_only depth.
+    LM / ESM / multi-scale pyramid are deferred (see plan file).
+    """
+
+    def __init__(
+        self,
+        scene,
+        target_camera=None,
+        gain=0.5,
+        sigma_blur=1.0,
+        use_gzn=True,
+        grad_percentile=50.0,
+        sat_lo=0.02,
+        sat_hi=0.98,
+        min_depth=1e-4,
+        max_pixels=50_000,
+        use_huber=True,
+        huber_k=None,
+        use_intrinsic_depth=True,
+        depth_provider=None,
+        seed=0,
+    ):
+        if scene is None and depth_provider is None:
+            raise ValueError(
+                "PhotometricController needs `scene` (with render_depth) "
+                "or an explicit `depth_provider`."
+            )
+        self.scene = scene
+        self.target_camera = target_camera
+        self.gain = float(gain)
+        self.sigma_blur = float(sigma_blur)
+        self.use_gzn = bool(use_gzn)
+        self.grad_percentile = float(grad_percentile)
+        self.sat_lo = float(sat_lo)
+        self.sat_hi = float(sat_hi)
+        self.min_depth = float(min_depth)
+        self.max_pixels = int(max_pixels) if max_pixels else 0
+        self.use_huber = bool(use_huber)
+        self.huber_k = None if huber_k is None else float(huber_k)
+        self.use_intrinsic_depth = bool(use_intrinsic_depth)
+        self.depth_provider = depth_provider
+
+        self._rng = np.random.default_rng(int(seed))
+
+        # Camera-grid cache.
+        self._camera_grid_key = None
+        self._x_norm_full = None
+        self._y_norm_full = None
+
+        # Desired-side cache (per target).
+        self._cached_target_id = None
+        self._I_star_flat = None
+        self._Z_star_flat_masked = None
+        self._xn_flat_masked = None
+        self._yn_flat_masked = None
+        self._mask_idx = None
+        self._num_total_valid = 0
+
+        self.last_info = {}
+        self.last_visualization = {}
+
+    # -- public ----------------------------------------------------------------
+
+    def set_target_camera(self, camera):
+        """Provide / replace the desired-pose camera. Invalidates the cache."""
+        self.target_camera = camera
+        self._cached_target_id = None
+
+    def __call__(self, rendered, target, camera, iteration):
+        self._ensure_camera_grid(camera)
+
+        if self._cached_target_id != id(target) or int(iteration) == 0:
+            self._build_target_cache(target)
+
+        e, L, depths_used = self._compute_residual_and_L(rendered)
+
+        huber_k_active = None
+        if self.use_huber and e.size > 0:
+            w, huber_k_active = huber_weights(e, k=self.huber_k)
+            sqrt_w = np.sqrt(w)
+            e = e * sqrt_w
+            L = L * sqrt_w[:, None]
+
+        if e.size < 6:
+            velocity = np.zeros(6, dtype=np.float32)
+        else:
+            H = L.T @ L
+            b = L.T @ e
+            H_reg = H + 1e-9 * np.eye(6, dtype=np.float32)
+            try:
+                step = np.linalg.solve(H_reg, b)
+            except np.linalg.LinAlgError:
+                step = np.linalg.pinv(L) @ e
+            velocity = (-self.gain * step).astype(np.float32)
+
+        n_used = int(e.size)
+        if depths_used.size:
+            mean_d = float(depths_used.mean())
+            min_d = float(depths_used.min())
+            max_d = float(depths_used.max())
+        else:
+            mean_d = min_d = max_d = float("nan")
+
+        self.last_info = {
+            "iteration": int(iteration),
+            "feature_mode": "photometric",
+            "controller": "photometric",
+            "num_raw_matches": n_used,
+            "num_inlier_matches": n_used,
+            "num_cached_features": n_used,
+            "num_dropped_features": int(self._num_total_valid - n_used),
+            "residual_norm": float(np.linalg.norm(e)),
+            "velocity_norm": float(np.linalg.norm(velocity)),
+            "mean_depth_m": mean_d,
+            "min_depth_m": min_d,
+            "max_depth_m": max_d,
+            "num_pixels_used": n_used,
+            "use_gzn": self.use_gzn,
+            "huber_k_active": (
+                float(huber_k_active) if huber_k_active is not None else None
+            ),
+        }
+        self.last_visualization = {
+            "iteration": int(iteration),
+            "feature_mode": "photometric",
+            "num_pixels_used": n_used,
+            "residual_norm": float(np.linalg.norm(e)),
+        }
+        return velocity
+
+    # -- internals -------------------------------------------------------------
+
+    def _depth(self, image, camera=None):
+        if self.depth_provider is not None:
+            return np.asarray(self.depth_provider(image), dtype=np.float32)
+        if self.use_intrinsic_depth:
+            if self.scene is None:
+                raise RuntimeError("scene required for intrinsic depth")
+            return np.asarray(
+                self.scene.render_depth(camera), dtype=np.float32
+            )
+        return get_depth(image, scene=self.scene, use_intrinsic=False)
+
+    def _ensure_camera_grid(self, camera):
+        key = (camera.fx, camera.fy, camera.cx, camera.cy, camera.H, camera.W)
+        if self._camera_grid_key == key:
+            return
+        self._x_norm_full, self._y_norm_full = pixel_grid_normalized(camera)
+        self._camera_grid_key = key
+        # Intrinsics changed -> any cached target state is stale.
+        self._cached_target_id = None
+
+    def _preprocess(self, rgb):
+        gray = image_to_gray(rgb)
+        if self.use_gzn:
+            return gzn_transform(gray, self.sigma_blur)
+        return gaussian_blur(gray, self.sigma_blur)
+
+    def _build_target_cache(self, target):
+        if self.target_camera is None:
+            raise RuntimeError(
+                "PhotometricController requires a target_camera (pass via "
+                "constructor or call set_target_camera(target_camera) before "
+                "run_servo_loop)."
+            )
+        if self._x_norm_full is None:
+            raise RuntimeError(
+                "Camera grid not initialised; _ensure_camera_grid must be "
+                "called before _build_target_cache."
+            )
+
+        I_star = self._preprocess(target)
+        gx_star, gy_star = image_gradient(I_star)
+        Z_star = self._depth(target, camera=self.target_camera)
+        if Z_star.shape != I_star.shape:
+            raise RuntimeError(
+                f"depth shape {Z_star.shape} != target image shape {I_star.shape}"
+            )
+
+        # In GZN-space sat bounds are meaningless; disable for the mask.
+        if self.use_gzn:
+            sat_lo, sat_hi = float("-inf"), float("inf")
+        else:
+            sat_lo, sat_hi = self.sat_lo, self.sat_hi
+
+        mask = build_pixel_mask(
+            I_star, gx_star, gy_star, Z_star,
+            grad_percentile=self.grad_percentile,
+            sat_lo=sat_lo,
+            sat_hi=sat_hi,
+            min_depth=self.min_depth,
+        )
+        mask_flat = mask.reshape(-1)
+        idx = np.flatnonzero(mask_flat).astype(np.int64)
+        self._num_total_valid = int(idx.size)
+
+        if self.max_pixels and idx.size > self.max_pixels:
+            sel = self._rng.choice(idx.size, size=self.max_pixels, replace=False)
+            idx = np.sort(idx[sel])
+
+        flat = lambda a: a.reshape(-1)
+        self._I_star_flat = flat(I_star)[idx].astype(np.float32, copy=False)
+        self._Z_star_flat_masked = flat(Z_star)[idx].astype(np.float32, copy=False)
+        self._xn_flat_masked = flat(self._x_norm_full)[idx].astype(np.float32, copy=False)
+        self._yn_flat_masked = flat(self._y_norm_full)[idx].astype(np.float32, copy=False)
+        self._mask_idx = idx
+        self._cached_target_id = id(target)
+
+    def _compute_residual_and_L(self, rendered):
+        I_cur = self._preprocess(rendered)
+        gx_cur, gy_cur = image_gradient(I_cur)
+
+        idx = self._mask_idx
+        if idx is None or idx.size == 0:
+            empty = np.zeros((0,), dtype=np.float32)
+            return empty, np.zeros((0, 6), dtype=np.float32), empty
+
+        I_cur_m = I_cur.reshape(-1)[idx]
+        gx_m = gx_cur.reshape(-1)[idx]
+        gy_m = gy_cur.reshape(-1)[idx]
+
+        e = (I_cur_m - self._I_star_flat).astype(np.float32, copy=False)
+        L = photometric_interaction(
+            gx_m, gy_m,
+            self._xn_flat_masked, self._yn_flat_masked,
+            self._Z_star_flat_masked,
+        )
+        return e, L, self._Z_star_flat_masked

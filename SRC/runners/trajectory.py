@@ -5,9 +5,11 @@ For each consecutive pair (i, i + STRIDE) in a dataset:
   - the final pose becomes the start pose of the next mini task
 Append the final pose to a sim trajectory, the GT pose of frame i+STRIDE to a
 GT trajectory, write both as TUM files and evaluate with evo (APE/RPE + plots).
+
+Use via the CLI:
+    python cli.py trajectory --config <path> [--set k=v ...] [--resume[=path]]
 """
 
-import argparse
 import csv
 import json
 import re
@@ -15,20 +17,7 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
-from scipy.spatial.transform import Rotation
-
-from camera import Camera
-from controllers import IBVSController
-from dataset import load_colmap, load_scannet
-from experiment_config import (
-    TRAJECTORY_CONFIG_KEYS,
-    apply_config,
-    format_applied_config,
-    load_cli_config,
-)
-from features import FeatureMatcher
-from main_servo_frames import (
+from runners.servo_frames import (
     PROJECT_ROOT,
     RUNS_ROOT,
     camera_metadata,
@@ -38,35 +27,68 @@ from main_servo_frames import (
     sorted_frame_ids,
     translation_error_from_pose,
 )
-from scenes.gs import GSScene
-from scenes.mesh import MeshScene
-from servo import SimpleStopper, copy_camera_with_pose, run_servo_loop
-from viz import save_side_by_side
+
+# Heavy deps (numpy / scipy / scenes / controllers / evo / matplotlib) are
+# imported inside the function that uses them so `cli.py` can register this
+# subcommand without pulling them in.
 
 
-# ---- experiment configuration ----------------------------------------------
-DATASETS = ["kitchen"]  # scene folders under DATA/
-RENDERER = "mesh"          # "mesh", "gs", or "nerf"
-NERF_POSE_SOURCE = "scannet"  # "colmap" or "scannet" (only used when RENDERER == "nerf")
-NERF_RENDER_SCALE = 0.25  # lower than 1.0 avoids full-res slow NeRF renders
-MESH_PATH = "mesh.ply"  # relative to each scene dir, or absolute
-MESH_POSE_SOURCE = "scannet"  # "scannet" for mesh.ply, "colmap" for COLMAP meshes
-STRIDE = 1               # frames between consecutive mini-servo tasks
-MINI_ITERATIONS = 10     # max iterations per mini servo
+DATASETS = ["living"]
+RENDERER = "gs"
+NERF_RENDER_SCALE = 0.25
+STRIDE = 1
+MINI_ITERATIONS = 10
 DT = 1.0
-DEPTH_MODE = "intrinsic"  # "learned" or "intrinsic"
-FEATURE_METHOD = "xfeat"
-GAIN = 0.75
+DEPTH_MODE = "intrinsic"
+FEATURE_METHOD = "sift"
+RUN_TAG = "GS_SIFT_INTRINSIC"
+GAIN_IBVS = 0.75
+GAIN_PHOTO = 0.005
 MIN_FEATURES = 3
 RATIO = 1
-START_INDEX = 1          # 1-based logical index of the first GT pose
-MAX_PAIRS = None         # None = all pairs, int = limit number of mini tasks
+START_INDEX = 1
+MAX_PAIRS = None
 EARLY_STOP_ERROR_THRESHOLD = 1e-5
 EARLY_STOP_VELOCITY_GRAD_EPS = 1e-8
-RPE_DELTA = 1            # frames between RPE pose pairs
-RUN_TAG = "BF_XFEAT_INTRINSIC"        # optional override for the run directory name
-SAVE_TASK_VIZ = True    # save side-by-side (final render | target RGB) per mini task
-TASK_VIZ_EVERY = 1       # save every Nth task only (SAVE_TASK_VIZ must be True)
+RPE_DELTA = 1
+SAVE_TASK_VIZ = True
+TASK_VIZ_EVERY = 1
+
+CONTROLLER = "ibvs"
+SIGMA_BLUR = 1.0
+USE_GZN = True
+GRAD_PERCENTILE = 50.0
+PHOTOMETRIC_MAX_PIXELS = 50_000
+USE_HUBER = True
+HUBER_K = None
+
+
+def add_arguments(parser):
+    parser.add_argument(
+        "--config",
+        help="JSON experiment config, resolved relative to CONFIGS/ if needed.",
+    )
+    parser.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "Override a config value. May be repeated, e.g. "
+            "--set renderer=mesh --set datasets=kitchen."
+        ),
+    )
+    parser.add_argument(
+        "--resume",
+        nargs="?",
+        const="auto",
+        default=None,
+        help=(
+            "Resume an interrupted run. With no value, auto-picks the most "
+            "recent run dir matching the current tag. Pass a path to target a "
+            "specific run dir."
+        ),
+    )
 
 
 def frame_id_from_path(path):
@@ -93,6 +115,8 @@ def make_frame_index(records):
 
 
 def scale_camera(camera, scale):
+    from camera import Camera
+
     scale = float(scale)
     if scale == 1.0:
         return camera
@@ -128,54 +152,39 @@ def scale_frame_records(records, scale):
     return scaled
 
 
-def resolve_scene_asset(scene_dir, path_value):
-    if path_value is None:
-        return scene_dir / "mesh.ply"
+def build_trajectory_tasks(frame_ids):
+    start_pos = max(0, int(START_INDEX) - 1)
+    tasks = []
+    for src_pos in range(start_pos, len(frame_ids) - STRIDE, STRIDE):
+        tasks.append({
+            "src_frame": frame_ids[src_pos],
+            "target_frame": frame_ids[src_pos + STRIDE],
+            "reset": False,
+        })
+    if tasks:
+        tasks[0]["reset"] = True
 
-    path = Path(str(path_value)).expanduser()
-    if path.is_absolute():
-        return path
+    if MAX_PAIRS is not None:
+        tasks = tasks[: int(MAX_PAIRS)]
 
-    scene_path = scene_dir / path
-    if scene_path.exists():
-        return scene_path
-
-    project_path = PROJECT_ROOT / path
-    if project_path.exists():
-        return project_path
-
-    return scene_path
+    return tasks
 
 
 def load_trajectory_scene_and_frames(scene_dir):
+    from dataset import load_colmap
+
+    records = load_colmap(scene_dir)
     if RENDERER == "mesh":
-        pose_source = str(MESH_POSE_SOURCE).lower()
-        if pose_source == "scannet":
-            records = load_scannet(scene_dir)
-        elif pose_source == "colmap":
-            records = load_colmap(scene_dir)
-        else:
-            raise ValueError(
-                f"MESH_POSE_SOURCE must be 'scannet' or 'colmap', got {pose_source!r}"
-            )
-        mesh_path = resolve_scene_asset(scene_dir, MESH_PATH)
+        from scenes.mesh import MeshScene
+        mesh_path = scene_dir / "mesh.ply"
         if not mesh_path.exists():
             raise FileNotFoundError(f"Mesh file not found: {mesh_path}")
-        print(f"Using mesh {mesh_path} with {pose_source} poses")
+        print(f"Using mesh {mesh_path}")
         scene = MeshScene(mesh_path)
     elif RENDERER == "gs":
-        records = load_colmap(scene_dir)
+        from scenes.gs import GSScene
         scene = GSScene(scene_dir / "gs.ply")
     elif RENDERER == "nerf":
-        pose_source = str(NERF_POSE_SOURCE).lower()
-        if pose_source == "scannet":
-            records = load_scannet(scene_dir)
-        elif pose_source == "colmap":
-            records = load_colmap(scene_dir)
-        else:
-            raise ValueError(
-                f"NERF_POSE_SOURCE must be 'scannet' or 'colmap', got {pose_source!r}"
-            )
         records = scale_frame_records(records, NERF_RENDER_SCALE)
         if float(NERF_RENDER_SCALE) != 1.0:
             print(f"Using NeRF render scale {float(NERF_RENDER_SCALE):g}")
@@ -191,9 +200,11 @@ def load_trajectory_scene_and_frames(scene_dir):
 
 
 def pose_to_tum_row(timestamp, T_world_cam):
+    from scipy.spatial.transform import Rotation
+
     t = T_world_cam[:3, 3]
     R = T_world_cam[:3, :3]
-    q = Rotation.from_matrix(R).as_quat()  # (x, y, z, w)
+    q = Rotation.from_matrix(R).as_quat()
     return (
         f"{timestamp:.6f} "
         f"{t[0]:.9f} {t[1]:.9f} {t[2]:.9f} "
@@ -202,6 +213,8 @@ def pose_to_tum_row(timestamp, T_world_cam):
 
 
 def write_tum(path, timestamps, poses):
+    import numpy as np
+
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
@@ -210,14 +223,15 @@ def write_tum(path, timestamps, poses):
 
 
 def poses_to_evo_trajectory(timestamps, poses):
+    import numpy as np
     from evo.core.trajectory import PoseTrajectory3D
+    from scipy.spatial.transform import Rotation
 
     positions = np.array([np.asarray(T)[:3, 3] for T in poses], dtype=np.float64)
     quats_xyzw = np.array(
         [Rotation.from_matrix(np.asarray(T)[:3, :3]).as_quat() for T in poses],
         dtype=np.float64,
     )
-    # evo expects quaternions in (w, x, y, z) order.
     quats_wxyz = quats_xyzw[:, [3, 0, 1, 2]]
     ts = np.asarray(timestamps, dtype=np.float64)
     return PoseTrajectory3D(positions, quats_wxyz, ts)
@@ -345,6 +359,7 @@ def evaluate_and_plot(timestamps, sim_poses, gt_poses, out_dir, scene_name):
 
 PER_TASK_FIELDS = [
     "task_index",
+    "sequence_reset",
     "src_frame",
     "target_frame",
     "src_rgb",
@@ -393,6 +408,9 @@ def read_per_task_csv(path):
 
 
 def read_tum(path):
+    import numpy as np
+    from scipy.spatial.transform import Rotation
+
     path = Path(path)
     timestamps = []
     poses = []
@@ -433,39 +451,67 @@ def find_latest_resumable_run(renderer, tag):
 
 
 def run_scene(scene_name, run_root, resume=False):
+    from controllers import IBVSController, PhotometricController
+    from features import FeatureMatcher
+    from photometric import PhotometricControllerTorch
+    from servo import SimpleStopper, copy_camera_with_pose, run_servo_loop
+    from viz import save_side_by_side
+
     scene_dir = PROJECT_ROOT / "DATA" / scene_name
     if not scene_dir.exists():
         raise RuntimeError(f"Scene directory not found: {scene_dir}")
 
     scene, frame_index = load_trajectory_scene_and_frames(scene_dir)
     frame_ids = sorted_frame_ids(frame_index)
-    if len(frame_ids) < 1 + STRIDE:
+    tasks = build_trajectory_tasks(frame_ids)
+    if not tasks:
         raise RuntimeError(
-            f"{scene_name}: only {len(frame_ids)} frames, need >= {1 + STRIDE}"
+            f"{scene_name}: no valid frame pairs at stride {STRIDE} "
+            f"from START_INDEX={START_INDEX}"
         )
 
-    start_pos = max(0, int(START_INDEX) - 1)
-    if start_pos >= len(frame_ids) - STRIDE:
-        raise RuntimeError(
-            f"{scene_name}: START_INDEX={START_INDEX} leaves no pairs at stride {STRIDE}"
-        )
-
-    pair_starts = list(range(start_pos, len(frame_ids) - STRIDE, STRIDE))
-    if MAX_PAIRS is not None:
-        pair_starts = pair_starts[: int(MAX_PAIRS)]
-
-    initial_frame = frame_index[frame_ids[start_pos]]
+    initial_frame = frame_index[tasks[0]["src_frame"]]
     initial_camera = initial_frame["camera"]
 
     matcher = FeatureMatcher(method=FEATURE_METHOD)
-    controller = IBVSController(
-        matcher=matcher,
-        gain=GAIN,
-        min_features=MIN_FEATURES,
-        scene=scene,
-        use_intrinsic_depth=(DEPTH_MODE == "intrinsic"),
-        ratio=RATIO,
-    )
+    if CONTROLLER == "ibvs":
+        controller = IBVSController(
+            matcher=matcher,
+            gain=GAIN_IBVS,
+            min_features=MIN_FEATURES,
+            scene=scene,
+            use_intrinsic_depth=(DEPTH_MODE == "intrinsic"),
+            ratio=RATIO,
+        )
+    elif CONTROLLER == "photometric":
+        controller = PhotometricController(
+            scene=scene,
+            target_camera=None,
+            gain=GAIN_PHOTO,
+            sigma_blur=SIGMA_BLUR,
+            use_gzn=USE_GZN,
+            grad_percentile=GRAD_PERCENTILE,
+            max_pixels=PHOTOMETRIC_MAX_PIXELS,
+            use_huber=USE_HUBER,
+            huber_k=HUBER_K,
+            use_intrinsic_depth=(DEPTH_MODE == "intrinsic"),
+        )
+    elif CONTROLLER == "photometric_torch":
+        controller = PhotometricControllerTorch(
+            scene=scene,
+            target_camera=None,
+            gain=GAIN_PHOTO,
+            sigma_blur=SIGMA_BLUR,
+            use_gzn=USE_GZN,
+            grad_percentile=GRAD_PERCENTILE,
+            max_pixels=PHOTOMETRIC_MAX_PIXELS,
+            use_huber=USE_HUBER,
+            huber_k=HUBER_K,
+            use_intrinsic_depth=(DEPTH_MODE == "intrinsic"),
+            method="lm",
+        )
+    else:
+        raise ValueError(f"Unknown CONTROLLER={CONTROLLER!r}")
 
     scene_out = Path(run_root) / scene_name
     scene_out.mkdir(parents=True, exist_ok=True)
@@ -503,30 +549,37 @@ def run_scene(scene_name, run_root, resume=False):
             f"continuing from task {resume_offset}"
         )
 
-    if resume_offset >= len(pair_starts):
-        print(f"[{scene_name}] all {len(pair_starts)} tasks complete; running eval only")
+    if resume_offset >= len(tasks):
+        print(f"[{scene_name}] all {len(tasks)} tasks complete; running eval only")
         current_camera = copy_camera_with_pose(initial_camera, sim_poses[-1])
     else:
         current_camera = copy_camera_with_pose(initial_camera, sim_poses[-1])
         if resume_offset == 0:
-            # ensure files exist so subsequent resume can find them
             write_tum(sim_tum, timestamps, sim_poses)
             write_tum(gt_tum, timestamps, gt_poses)
 
-    for task_idx, src_pos in enumerate(pair_starts):
+    for task_idx, task in enumerate(tasks):
         if task_idx < resume_offset:
             continue
-        tgt_pos = src_pos + STRIDE
-        src_frame_id = frame_ids[src_pos]
-        tgt_frame_id = frame_ids[tgt_pos]
+        src_frame_id = task["src_frame"]
+        tgt_frame_id = task["target_frame"]
+        src_frame = frame_index[src_frame_id]
         tgt_frame = frame_index[tgt_frame_id]
         target_camera = tgt_frame["camera"]
+
+        if task["reset"]:
+            current_camera = copy_camera_with_pose(
+                src_frame["camera"],
+                src_frame["camera"].T_world_cam.copy(),
+            )
 
         target_image = load_rgb(
             tgt_frame["rgb_path"],
             current_camera.W,
             current_camera.H,
         )
+        if isinstance(controller, (PhotometricController, PhotometricControllerTorch)):
+            controller.set_target_camera(target_camera)
         stopper = SimpleStopper(
             error_threshold=EARLY_STOP_ERROR_THRESHOLD,
             velocity_grad_eps=EARLY_STOP_VELOCITY_GRAD_EPS,
@@ -594,6 +647,7 @@ def run_scene(scene_name, run_root, resume=False):
 
         task_row = {
             "task_index": task_idx,
+            "sequence_reset": int(bool(task["reset"])),
             "src_frame": src_frame_id,
             "target_frame": tgt_frame_id,
             "src_rgb": str(frame_index[src_frame_id]["rgb_path"]),
@@ -606,7 +660,6 @@ def run_scene(scene_name, run_root, resume=False):
         }
         per_task_rows.append(task_row)
 
-        # Incremental save so a crash mid-run is recoverable via --resume.
         write_tum(sim_tum, timestamps, sim_poses)
         write_tum(gt_tum, timestamps, gt_poses)
         append_task_row(csv_path, task_row)
@@ -619,8 +672,6 @@ def run_scene(scene_name, run_root, resume=False):
             f"rot_err={rotation_err:.8e}deg"
         )
 
-        # Chain: next mini task starts from the previous final pose
-        # (intrinsics from target are identical across the scene).
         current_camera = copy_camera_with_pose(target_camera, sim_T)
 
     metrics = {}
@@ -641,19 +692,16 @@ def run_scene(scene_name, run_root, resume=False):
         "scene": scene_name,
         "scene_dir": str(scene_dir),
         "renderer": RENDERER,
-        "nerf_pose_source": NERF_POSE_SOURCE,
         "nerf_render_scale": float(NERF_RENDER_SCALE),
         "mesh_path": (
-            str(resolve_scene_asset(scene_dir, MESH_PATH))
-            if RENDERER == "mesh"
-            else None
+            str(scene_dir / "mesh.ply") if RENDERER == "mesh" else None
         ),
-        "mesh_pose_source": MESH_POSE_SOURCE if RENDERER == "mesh" else None,
         "stride": int(STRIDE),
         "mini_iterations": int(MINI_ITERATIONS),
         "depth_mode": DEPTH_MODE,
         "feature_method": FEATURE_METHOD,
-        "gain": float(GAIN),
+        "gain_ibvs": float(GAIN_IBVS),
+        "gain_photo": float(GAIN_PHOTO),
         "ratio": int(RATIO),
         "start_index": int(START_INDEX),
         "max_pairs": MAX_PAIRS,
@@ -673,38 +721,14 @@ def run_scene(scene_name, run_root, resume=False):
     return summary
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument(
-        "--config",
-        help="JSON experiment config, resolved relative to CONFIGS/ if needed.",
+def run(args):
+    from experiment_config import (
+        TRAJECTORY_CONFIG_KEYS,
+        apply_config,
+        format_applied_config,
+        load_cli_config,
     )
-    p.add_argument(
-        "--set",
-        action="append",
-        default=[],
-        metavar="KEY=VALUE",
-        help=(
-            "Override a config value. May be repeated, e.g. "
-            "--set renderer=mesh --set datasets=kitchen."
-        ),
-    )
-    p.add_argument(
-        "--resume",
-        nargs="?",
-        const="auto",
-        default=None,
-        help=(
-            "Resume an interrupted run. With no value, auto-picks the most "
-            "recent run dir matching the current tag. Pass a path to target a "
-            "specific run dir."
-        ),
-    )
-    return p.parse_args()
 
-
-def main():
-    args = parse_args()
     applied_config = load_cli_config(
         args.config,
         args.set,
@@ -753,7 +777,3 @@ def main():
     with open(run_root / "trajectory_summary.json", "w") as f:
         json.dump(overall, f, indent=2)
     print(f"\nWrote {run_root}")
-
-
-if __name__ == "__main__":
-    main()

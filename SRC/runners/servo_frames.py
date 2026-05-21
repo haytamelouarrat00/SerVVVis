@@ -1,35 +1,25 @@
-import argparse
+"""Single frame-to-frame servo runner.
+
+Use via the CLI:
+    python cli.py servo-frames --config <path> [--set k=v ...]
+
+Heavy imports (controllers, scenes, photometric) are deferred to `run()` so
+this module can be imported by `cli.py` without pulling them in.
+"""
+
 import csv
 import json
 import re
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
-from PIL import Image
 
-from controllers import IBVSController
-from dataset import load_colmap, load_scannet
-from experiment_config import (
-    SERVO_FRAMES_CONFIG_KEYS,
-    apply_config,
-    format_applied_config,
-    load_cli_config,
-)
-from features import FeatureMatcher
-from scenes.gs import GSScene
-from scenes.mesh import MeshScene
-from servo import SimpleStopper, run_servo_loop
-from viz import save_error_evolution
-
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 RUNS_ROOT = PROJECT_ROOT / "RUNS"
 
 # Edit these values to define the frame-to-frame servo experiment.
 SCENE_DIR = PROJECT_ROOT / "DATA" / "kitchen"
 RENDERER = "mesh"  # "mesh", "gs", or "nerf"
-NERF_POSE_SOURCE = "scannet"  # "colmap" or "scannet" (only used when RENDERER == "nerf")
 START_INDEX = 1
 INDEX_AWAY = 1
 TARGET_INDEX = None
@@ -37,22 +27,30 @@ ITERATIONS = 100
 DT = 1.0
 DEPTH_MODE = "intrinsic"  # "learned" = MoGe2, "intrinsic" = scene.render_depth()
 FEATURE_METHOD = "sift"
-VIZ_ITER = 1  # Save visualization every VIZ_ITER iterations. 0 disables images.
-GAIN = 0.75
+VIZ_ITER = 1
+GAIN_IBVS = 0.75
+GAIN_PHOTO = 0.005
 MIN_FEATURES = 3
-RATIO = 1 # 0 = match once then reproject forever; N = re-match every Nth iter.
+RATIO = 1
 RUN_NAME = None
 EARLY_STOP_ERROR_THRESHOLD = 1e-5
 EARLY_STOP_VELOCITY_GRAD_EPS = 1e-8
 
+CONTROLLER = "ibvs"  # "ibvs", "photometric", or "photometric_torch"
+SIGMA_BLUR = 1.0
+USE_GZN = True
+GRAD_PERCENTILE = 50.0
+PHOTOMETRIC_MAX_PIXELS = 50_000
+USE_HUBER = True
+HUBER_K = None
 
-def parse_args():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument(
+
+def add_arguments(parser):
+    parser.add_argument(
         "--config",
         help="JSON experiment config, resolved relative to CONFIGS/ if needed.",
     )
-    p.add_argument(
+    parser.add_argument(
         "--set",
         action="append",
         default=[],
@@ -62,7 +60,6 @@ def parse_args():
             "--set renderer=mesh --set scene=kitchen."
         ),
     )
-    return p.parse_args()
 
 
 def normalize_frame_id(value):
@@ -82,12 +79,18 @@ def frame_number(frame_id):
 
 
 def load_rgb(rgb_path, width, height):
+    import numpy as np
+    from PIL import Image
+
     image = Image.open(rgb_path).convert("RGB")
     image = image.resize((int(width), int(height)))
     return np.asarray(image, dtype=np.float32) / 255.0
 
 
 def save_rgb(path, image):
+    import numpy as np
+    from PIL import Image
+
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     image_u8 = (np.asarray(image) * 255.0).clip(0, 255).astype(np.uint8)
@@ -97,8 +100,6 @@ def save_rgb(path, image):
 def make_frame_index(records, renderer):
     index = {}
     for record in records:
-        # ScanNet loader emits (camera, rgb_path, depth_path); COLMAP loader
-        # emits (camera, rgb_path). Accept either shape.
         if len(record) == 3:
             camera, rgb_path, _ = record
         elif len(record) == 2:
@@ -160,23 +161,17 @@ def resolve_frame_from_index(frame_index, renderer, logical_index):
     return frame_ids[position]
 
 
-def load_scene_and_frames(scene_dir, renderer, nerf_pose_source=None):
+def load_scene_and_frames(scene_dir, renderer):
+    from dataset import load_colmap
+
+    records = load_colmap(scene_dir)
     if renderer == "mesh":
-        records = load_scannet(scene_dir)
-        scene = MeshScene(scene_dir / "poisson.ply")
+        from scenes.mesh import MeshScene
+        scene = MeshScene(scene_dir / "mesh.ply")
     elif renderer == "gs":
-        records = load_colmap(scene_dir)
+        from scenes.gs import GSScene
         scene = GSScene(scene_dir / "gs.ply")
     elif renderer == "nerf":
-        source = (nerf_pose_source or NERF_POSE_SOURCE).lower()
-        if source == "scannet":
-            records = load_scannet(scene_dir)
-        elif source == "colmap":
-            records = load_colmap(scene_dir)
-        else:
-            raise ValueError(
-                f"NERF_POSE_SOURCE must be 'colmap' or 'scannet', got {source!r}"
-            )
         from scenes.nerf import NeRFScene
         scene = NeRFScene(scene_dir)
     else:
@@ -189,6 +184,8 @@ def load_scene_and_frames(scene_dir, renderer, nerf_pose_source=None):
 
 
 def rotation_error_from_pose(T_world_cam, target_T_world_cam):
+    import numpy as np
+
     R_current = T_world_cam[:3, :3]
     R_target = target_T_world_cam[:3, :3]
     R_delta = R_target.T @ R_current
@@ -202,6 +199,8 @@ def rotation_error_deg(camera, target_camera):
 
 
 def translation_error_from_pose(T_world_cam, target_T_world_cam):
+    import numpy as np
+
     delta = T_world_cam[:3, 3] - target_T_world_cam[:3, 3]
     return float(np.linalg.norm(delta))
 
@@ -211,6 +210,8 @@ def translation_error_m(camera, target_camera):
 
 
 def write_history_csv(path, history):
+    import numpy as np
+
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
@@ -269,6 +270,8 @@ def write_history_csv(path, history):
 
 
 def history_for_json(history):
+    import numpy as np
+
     rows = []
     for item in history:
         rows.append({
@@ -295,7 +298,6 @@ def history_for_json(history):
 
 
 def controller_short_name(controller):
-    """e.g. IBVSController -> 'ibvs'."""
     name = controller.__class__.__name__
     if name.lower().endswith("controller"):
         name = name[: -len("Controller")]
@@ -318,9 +320,6 @@ def make_trial_name(start_index, target_index, depth_mode):
 
 
 def make_run_dir(controller, scene_name, renderer, start_index, target_index, depth_mode):
-    """Build hierarchical run directory:
-    RUNS/<controller>/<renderer>/<scene>/<trial>/<timestamp>_<tag>[_NN]
-    """
     trial_dir = (
         RUNS_ROOT
         / controller_short_name(controller)
@@ -329,7 +328,8 @@ def make_run_dir(controller, scene_name, renderer, start_index, target_index, de
         / make_trial_name(start_index, target_index, depth_mode)
     )
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    tag = make_run_tag(GAIN, FEATURE_METHOD, RATIO)
+    active_gain = GAIN_PHOTO if CONTROLLER != "ibvs" else GAIN_IBVS
+    tag = make_run_tag(active_gain, FEATURE_METHOD, RATIO)
     base = f"{timestamp}_{tag}"
     candidate = trial_dir / base
     suffix = 2
@@ -413,17 +413,37 @@ def experiment_config(
         "depth_mode": DEPTH_MODE,
         "feature_method": FEATURE_METHOD,
         "viz_iter": int(VIZ_ITER),
-        "gain": float(GAIN),
+        "gain_ibvs": float(GAIN_IBVS),
+        "gain_photo": float(GAIN_PHOTO),
         "min_features": int(MIN_FEATURES),
         "ratio": int(RATIO),
         "run_name": RUN_NAME,
         "early_stop_error_threshold": float(EARLY_STOP_ERROR_THRESHOLD),
         "early_stop_velocity_grad_eps": float(EARLY_STOP_VELOCITY_GRAD_EPS),
+        "controller_kind": CONTROLLER,
+        "sigma_blur": float(SIGMA_BLUR),
+        "use_gzn": bool(USE_GZN),
+        "grad_percentile": float(GRAD_PERCENTILE),
+        "photometric_max_pixels": int(PHOTOMETRIC_MAX_PIXELS),
+        "use_huber": bool(USE_HUBER),
+        "huber_k": (None if HUBER_K is None else float(HUBER_K)),
     }
 
 
-def main():
-    args = parse_args()
+def run(args):
+    import numpy as np
+    from controllers import IBVSController, PhotometricController
+    from experiment_config import (
+        SERVO_FRAMES_CONFIG_KEYS,
+        apply_config,
+        format_applied_config,
+        load_cli_config,
+    )
+    from features import FeatureMatcher
+    from photometric import PhotometricControllerTorch
+    from servo import SimpleStopper, run_servo_loop
+    from viz import save_error_evolution
+
     applied_config = load_cli_config(
         args.config,
         args.set,
@@ -437,11 +457,7 @@ def main():
     if DEPTH_MODE not in ("learned", "intrinsic"):
         raise ValueError("DEPTH_MODE must be 'learned' or 'intrinsic'")
 
-    scene, frame_index = load_scene_and_frames(
-        SCENE_DIR,
-        RENDERER,
-        nerf_pose_source=NERF_POSE_SOURCE,
-    )
+    scene, frame_index = load_scene_and_frames(SCENE_DIR, RENDERER)
     start_index = int(START_INDEX)
     target_index = resolve_target_index(start_index, TARGET_INDEX, INDEX_AWAY)
     start_frame = resolve_frame_from_index(frame_index, RENDERER, start_index)
@@ -453,14 +469,44 @@ def main():
     target_camera = target["camera"]
 
     matcher = FeatureMatcher(method=FEATURE_METHOD)
-    controller = IBVSController(
-        matcher=matcher,
-        gain=GAIN,
-        min_features=MIN_FEATURES,
-        scene=scene,
-        use_intrinsic_depth=DEPTH_MODE == "intrinsic",
-        ratio=RATIO,
-    )
+    if CONTROLLER == "ibvs":
+        controller = IBVSController(
+            matcher=matcher,
+            gain=GAIN_IBVS,
+            min_features=MIN_FEATURES,
+            scene=scene,
+            use_intrinsic_depth=DEPTH_MODE == "intrinsic",
+            ratio=RATIO,
+        )
+    elif CONTROLLER == "photometric":
+        controller = PhotometricController(
+            scene=scene,
+            target_camera=target_camera,
+            gain=GAIN_PHOTO,
+            sigma_blur=SIGMA_BLUR,
+            use_gzn=USE_GZN,
+            grad_percentile=GRAD_PERCENTILE,
+            max_pixels=PHOTOMETRIC_MAX_PIXELS,
+            use_huber=USE_HUBER,
+            huber_k=HUBER_K,
+            use_intrinsic_depth=DEPTH_MODE == "intrinsic",
+        )
+    elif CONTROLLER == "photometric_torch":
+        controller = PhotometricControllerTorch(
+            scene=scene,
+            target_camera=target_camera,
+            gain=GAIN_PHOTO,
+            sigma_blur=SIGMA_BLUR,
+            use_gzn=USE_GZN,
+            grad_percentile=GRAD_PERCENTILE,
+            max_pixels=PHOTOMETRIC_MAX_PIXELS,
+            use_huber=USE_HUBER,
+            huber_k=HUBER_K,
+            use_intrinsic_depth=DEPTH_MODE == "intrinsic",
+            method="lm",
+        )
+    else:
+        raise ValueError(f"Unknown CONTROLLER={CONTROLLER!r}")
     controller_name = controller.__class__.__name__
 
     trial_dir, output_dir = make_run_dir(
@@ -610,7 +656,8 @@ def main():
         "scene": SCENE_DIR.name,
         "depth_mode": DEPTH_MODE,
         "feature_method": FEATURE_METHOD,
-        "gain": float(GAIN),
+        "gain_ibvs": float(GAIN_IBVS),
+        "gain_photo": float(GAIN_PHOTO),
         "ratio": int(RATIO),
         "start_index": int(start_index),
         "target_index": int(target_index),
@@ -646,7 +693,3 @@ def main():
             f"|v|={info['velocity_norm']:.6f}"
         )
     print(f"Wrote {output_dir}")
-
-
-if __name__ == "__main__":
-    main()
